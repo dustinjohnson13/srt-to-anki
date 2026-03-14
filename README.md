@@ -1,0 +1,4 @@
+- python3.13 -m venv anki_stable
+- source anki_stable/bin/activate
+- pip install -r requirements.txt
+- python -m spacy download pt_core_news_sm
