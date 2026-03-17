@@ -1,6 +1,7 @@
 deep-translator
 spacy
 gTTS
+pydub
 google-cloud-texttospeech
 azure-cognitiveservices-speech
 boto3
