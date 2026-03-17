@@ -1,6 +1,8 @@
 deep-translator
 spacy
 gTTS
+pydub
+audioop-lts; python_version >= "3.13"
 google-cloud-texttospeech
 azure-cognitiveservices-speech
 boto3

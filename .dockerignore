@@ -1,0 +1,8 @@
+anki_stable/
+.git/
+*.srt
+*_Audio/
+*_AnkiDeck.tsv
+.DS_Store
+.idea/
+__pycache__/

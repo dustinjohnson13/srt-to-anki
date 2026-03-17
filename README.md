@@ -4,6 +4,18 @@ Converts SRT subtitle files into Anki flashcard decks with audio and vocabulary 
 
 ## Setup
 
+### Docker (recommended)
+
+No local setup needed — just Docker:
+
+```bash
+./run.sh <path-to-srt-file> --audio <path-to-audio-file>
+```
+
+The `run.sh` script builds an image with Python 3.13, ffmpeg, and all dependencies, then runs the container with your files automatically mounted.
+
+### Manual
+
 ```bash
 python3.13 -m venv anki_stable
 source anki_stable/bin/activate
@@ -11,11 +23,45 @@ pip install -r requirements.txt
 python -m spacy download pt_core_news_sm
 ```
 
+Requires `ffmpeg` installed on the system if using `--audio` (e.g. `brew install ffmpeg`).
+
 ## Running
 
+### Audio extraction (subs2srs-style)
+
+Extract audio clips directly from a source audio file using SRT timestamps:
+
 ```bash
-source anki_stable/bin/activate
-python run.py <path-to-srt-file> [--tts PROVIDER]
+# Via Docker
+./run.sh episode.srt --audio episode.mp3
+
+# Manual
+python run.py episode.srt --audio episode.mp3
+```
+
+#### Audio options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--audio <file>` | _(none)_ | Source audio file to extract clips from |
+| `--audio-padding <ms>` | `100` | Padding in ms added before/after each clip |
+| `--audio-offset <ms>` | `0` | Shift SRT timestamps to align with audio. Positive = audio starts later than SRT, negative = earlier |
+
+```bash
+# Custom padding (200ms buffer around each clip)
+./run.sh episode.srt --audio episode.mp3 --audio-padding 200
+
+# Offset if audio and subtitles are misaligned
+./run.sh episode.srt --audio episode.mp3 --audio-offset 2000    # audio starts 2s after SRT
+./run.sh episode.srt --audio episode.mp3 --audio-offset -1500   # audio starts 1.5s before SRT
+```
+
+### TTS generation (no source audio)
+
+If you don't have a source audio file, the tool generates speech via TTS:
+
+```bash
+python run.py episode.srt --tts gtts
 ```
 
 ## Output
@@ -25,11 +71,11 @@ python run.py <path-to-srt-file> [--tts PROVIDER]
 
 Each card has:
 - **Front:** Brazilian Portuguese sentence + embedded audio
-- **Back:** English translation + vocab list (verbs, nouns, adjectives, adverbs) with lemmas and POS tags
+- **Back:** English translation + annotated vocab list: nouns with gender articles (o/a), verbs with conjugation class (-ar/-er/-ir), tense, mood, and person, plural indicators, and diminutive/augmentative markers
 
 ## TTS Providers
 
-The `--tts` flag selects the audio generation backend. Default is **gtts**.
+The `--tts` flag selects the audio generation backend (used when `--audio` is not provided). Default is **gtts**.
 
 | Provider | Flag | Quality | Cost | Requires | |
 |---|---|---|---|---|---|
