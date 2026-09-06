@@ -1,6 +1,6 @@
 # srt-to-anki
 
-Converts subtitle files into Anki flashcard decks with audio and vocabulary annotations. Portuguese or French → English.
+Converts subtitle files into Anki flashcard decks with audio and vocabulary annotations. Portuguese, French or Russian → English.
 
 Input: a `.srt` (or `.vtt`) subtitle file, optionally plus the episode audio.
 Output: `<name>_AnkiDeck.tsv` and `<name>_Audio/` (one numbered `.mp3` per card).
@@ -9,7 +9,7 @@ Cards are source sentence + `[sound:...]` on the front; English translation plus
 
 ## Setup
 
-**Docker** — `./run.sh <srt> --audio <audio>` builds the image (Python 3.13, ffmpeg, both spacy models) and mounts inputs automatically.
+**Docker** — `./run.sh <srt> --audio <audio>` builds the image (Python 3.13, ffmpeg, all three spacy models) and mounts inputs automatically.
 
 **Manual** — Python 3.13 plus `ffmpeg` on PATH:
 
@@ -18,6 +18,7 @@ python3.13 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m spacy download pt_core_news_sm
 python -m spacy download fr_core_news_sm
+python -m spacy download ru_core_news_sm
 ```
 
 ## Running
@@ -43,7 +44,7 @@ See README.md for the full flag table.
 ```
 run.py            # Entire application (single file)
 run.sh            # Docker build & run wrapper
-Dockerfile        # Python 3.13-slim + ffmpeg + pt/fr spacy models
+Dockerfile        # Python 3.13-slim + ffmpeg + pt/fr/ru spacy models
 requirements.txt  # pip dependencies
 Portuguese/       # Standalone PT cheat sheets + their own generator scripts
 README.md         # User-facing docs
@@ -53,6 +54,8 @@ README.md         # User-facing docs
 
 - **Single file:** all logic lives in `run.py`; no package structure, no tests
 - **Languages:** `--source-lang` (default `pt`) selects an entry from `LANGUAGE_CONFIGS`, which holds the spacy model, gTTS lang/tld, translator source, gender articles, verb suffixes, TTS voices, and diminutive/augmentative suffixes. Target is always English. Adding a language means adding one entry there plus the spacy model to the Dockerfile
+- **Non-Romance annotation:** several `LANGUAGE_CONFIGS` keys are optional and absent for `pt`/`fr`, so the annotation pass falls back to the Romance behaviour unchanged. `gender_tags` shows noun gender as a tag when the language has no articles; `show_case` adds a case tag to nouns and adjectives; `show_aspect` adds `impf.`/`perf.` to verbs; `reflexive_suffixes` strips the reflexive particle off the lemma (and tags `refl.`) before the conjugation class is matched; `tense_map` overrides `TENSE_LABELS` (Russian `Past` is a plain past, not a preterite); `polly_engine` selects the Polly engine (Russian has no neural voice). Label maps (`TENSE_LABELS`, `MOOD_LABELS`, `CASE_LABELS`, `ASPECT_LABELS`, `PERSON_LABELS`) are module-level. `PERSON_LABELS` accepts both spellings because spacy reports Person as `1`/`2`/`3` for pt/fr but `First`/`Second`/`Third` for ru
+- **Diminutives:** `diminutive_match` picks what the suffix list is tested against. The default `"surface"` requires the inflected form to differ from the lemma, which suits Romance diminutives (inflections of a base word). Russian sets `"lemma"` because its diminutives are separate lexemes whose nominative equals the lemma (`домик`), and its suffix list is kept short on purpose — the productive suffixes also end ordinary nouns (`ребёнок`, `чудовище`), so recall is traded for precision
 - **Subtitle parsing:** `parse_subtitle_block()` locates the timestamp by scanning for `-->` rather than assuming a line index, so VTT (no cue ID, optional metadata) works alongside SRT
 - **Annotation filter:** bracketed annotations are stripped by default. A block that is *only* annotation (`[explosao distante]`) is skipped; a tag prefixing real dialogue (`[Sonic] E tambem tem o Shadow.`) is removed and the dialogue kept, along with any dialogue dash the removal strands. `--keep-annotations` disables this
 - **Audio modes:** `--audio` slices clips from a source file using subtitle timings; otherwise TTS synthesizes them. `--audio-padding` (default 100ms) buffers each clip; `--audio-offset` (default 0) shifts all timestamps, positive meaning the audio runs later

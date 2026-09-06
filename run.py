@@ -11,6 +11,19 @@ from gtts import gTTS
 
 VOCAB_POS = {"VERB", "NOUN", "ADJ", "ADV"}
 
+# Morphology label maps shared by the annotation pass. A language config may
+# override the tense map ("Past" is a preterite in Romance, plain past in
+# Russian); the rest are language-neutral.
+TENSE_LABELS = {"Pres": "present", "Past": "preterite", "Imp": "imperfect", "Fut": "future", "Pqp": "pluperfect"}
+MOOD_LABELS = {"Sub": "subjunctive", "Imp": "imperative", "Cnd": "conditional"}
+CASE_LABELS = {
+    "Nom": "nom.", "Gen": "gen.", "Dat": "dat.", "Acc": "acc.",
+    "Ins": "instr.", "Loc": "prep.", "Voc": "voc.", "Par": "part.",
+}
+ASPECT_LABELS = {"Imp": "impf.", "Perf": "perf."}
+# spacy reports Person numerically for pt/fr but as words for ru.
+PERSON_LABELS = {"1": "1st", "2": "2nd", "3": "3rd", "First": "1st", "Second": "2nd", "Third": "3rd"}
+
 SRT_TIMESTAMP_RE = re.compile(
     r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})'
 )
@@ -55,6 +68,43 @@ LANGUAGE_CONFIGS = {
         },
         "diminutive_suffixes": [
             ("ette", "dim."), ("et", "dim."), ("eau", "dim."), ("ot", "dim."),
+        ],
+    },
+    "ru": {
+        "spacy_model": "ru_core_news_sm",
+        "gtts_lang": "ru",
+        "gtts_tld": None,
+        "translator_source": "ru",
+        # Russian has no articles, so gender rides along as a tag instead.
+        "gender_articles": {},
+        "gender_tags": {"Masc": "m.", "Fem": "f.", "Neut": "n."},
+        "show_case": True,
+        "show_aspect": True,
+        # Reflexives carry the particle in the lemma ("двигаться"); it is
+        # stripped before the conjugation class is matched.
+        "reflexive_suffixes": ["ся", "сь"],
+        # Longest first: -овать has to win over the -ать it ends with.
+        "verb_suffixes": [
+            "овать", "евать", "ывать", "ивать",
+            "ать", "ять", "еть", "ить", "оть", "уть", "ти", "чь",
+        ],
+        "tense_map": {"Pres": "present", "Past": "past", "Fut": "future"},
+        "tts_voices": {
+            "google-cloud": ("ru-RU", "ru-RU-Wavenet-A"),
+            "azure": "ru-RU-SvetlanaNeural",
+            "polly": ("Tatyana", "ru-RU"),
+        },
+        # Polly has no neural Russian voice; Tatyana is standard-engine only.
+        "polly_engine": "standard",
+        # Russian diminutives are their own lexemes ("домик" is not an inflected
+        # "дом"), so the suffix is matched on the lemma, not the surface form.
+        "diminutive_match": "lemma",
+        # Deliberately short. The productive suffixes (-ик, -ок, -ка, -ушка,
+        # -ище) are also the endings of ordinary nouns -- "ребёнок" is not a
+        # diminutive, "чудовище" is not an augmentative -- and a wrong tag is
+        # worse than a missing one, so only high-precision suffixes are listed.
+        "diminutive_suffixes": [
+            ("енька", "dim."), ("онька", "dim."), ("ечко", "dim."), ("ышко", "dim."),
         ],
     },
 }
@@ -178,12 +228,13 @@ def generate_audio(text, filepath, provider, lang_config):
         voice_id = os.environ.get("POLLY_VOICE_ID", default_voice)
         lang_code = os.environ.get("POLLY_LANGUAGE_CODE", default_lang_code)
         speed = os.environ.get("POLLY_SPEED", "slow")
+        engine = os.environ.get("POLLY_ENGINE", lang_config.get("polly_engine", "neural"))
         response = client.synthesize_speech(
             Text=f"<speak><prosody rate=\"{speed}\">{text}</prosody></speak>",
             TextType="ssml",
             OutputFormat="mp3",
             VoiceId=voice_id,
-            Engine="neural",
+            Engine=engine,
             LanguageCode=lang_code,
         )
         with open(filepath, "wb") as f:
@@ -548,21 +599,50 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                                 article = lang_config["gender_articles"].get(gender, "")
                                 if article:
                                     lemma = f"{article} {lemma}"
+                                else:
+                                    # Languages without articles (Russian) show
+                                    # gender as a tag instead.
+                                    gender_tag = lang_config.get("gender_tags", {}).get(gender)
+                                    if gender_tag:
+                                        tags.append(gender_tag)
                                 if morph.get("Number") == "Plur":
                                     tags.append("pl.")
+                                if lang_config.get("show_case"):
+                                    case = CASE_LABELS.get(morph.get("Case", ""))
+                                    if case:
+                                        tags.append(case)
 
                             elif token.pos_ == "VERB":
+                                conj_lemma = lemma
+                                # A reflexive particle sits on the end of the
+                                # lemma and would hide the conjugation class.
+                                for refl in lang_config.get("reflexive_suffixes", []):
+                                    if conj_lemma.endswith(refl) and len(conj_lemma) > len(refl) + 2:
+                                        conj_lemma = conj_lemma[: -len(refl)]
+                                        tags.append("refl.")
+                                        break
+                                if lang_config.get("show_aspect"):
+                                    aspect = ASPECT_LABELS.get(morph.get("Aspect", ""))
+                                    if aspect:
+                                        tags.append(aspect)
                                 # Conjugation class from lemma ending
                                 for suffix in lang_config["verb_suffixes"]:
-                                    if lemma.endswith(suffix):
+                                    if conj_lemma.endswith(suffix):
                                         tags.append(f"-{suffix}")
                                         break
                                 # Person and number
-                                person = morph.get("Person", "")
+                                person = PERSON_LABELS.get(morph.get("Person", ""), "")
                                 number = morph.get("Number", "")
+                                num_label = "sing." if number == "Sing" else "pl." if number == "Plur" else ""
                                 if person:
-                                    num_label = "sing." if number == "Sing" else "pl." if number == "Plur" else ""
-                                    tags.append(f"{person}rd {num_label}".strip() if person == "3" else f"{person}{'st' if person == '1' else 'nd'} {num_label}".strip())
+                                    tags.append(f"{person} {num_label}".strip())
+                                elif lang_config.get("gender_tags") and morph.get("Tense") == "Past":
+                                    # The Russian past tense inflects for gender
+                                    # and number rather than person.
+                                    gender_tag = lang_config["gender_tags"].get(morph.get("Gender", ""), "")
+                                    label = " ".join(x for x in (gender_tag, num_label) if x)
+                                    if label:
+                                        tags.append(label)
                                 # Tense and mood
                                 tense = morph.get("Tense", "")
                                 mood = morph.get("Mood", "")
@@ -575,21 +655,33 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                                     tags.append("participle")
                                 else:
                                     if tense:
-                                        tense_map = {"Pres": "present", "Past": "preterite", "Imp": "imperfect", "Fut": "future", "Pqp": "pluperfect"}
+                                        tense_map = lang_config.get("tense_map", TENSE_LABELS)
                                         tags.append(tense_map.get(tense, tense.lower()))
                                     if mood and mood != "Ind":
-                                        mood_map = {"Sub": "subjunctive", "Imp": "imperative", "Cnd": "conditional"}
-                                        tags.append(mood_map.get(mood, mood.lower()))
+                                        tags.append(MOOD_LABELS.get(mood, mood.lower()))
 
                             elif token.pos_ == "ADJ":
                                 if morph.get("Number") == "Plur":
                                     tags.append("pl.")
+                                if lang_config.get("show_case"):
+                                    case = CASE_LABELS.get(morph.get("Case", ""))
+                                    if case:
+                                        tags.append(case)
 
-                            # Diminutive/augmentative detection
-                            word_lower = token.text.lower()
-                            if word_lower != lemma.lower():
+                            # Diminutive/augmentative detection. A Romance
+                            # diminutive is an inflection of the base word, so
+                            # only an altered surface form counts. A Russian one
+                            # is its own lexeme ("домик"), whose nominative is
+                            # identical to its lemma, so match the lemma there.
+                            if lang_config.get("diminutive_match") == "lemma":
+                                candidate = token.lemma_.lower()
+                            else:
+                                candidate = token.text.lower()
+                                if candidate == lemma.lower():
+                                    candidate = ""
+                            if candidate:
                                 for suffix, label in lang_config["diminutive_suffixes"]:
-                                    if word_lower.endswith(suffix):
+                                    if candidate.endswith(suffix):
                                         tags.append(label)
                                         break
 

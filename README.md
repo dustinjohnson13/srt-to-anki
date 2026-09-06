@@ -1,6 +1,6 @@
 # srt-to-anki
 
-Turns a subtitle file into an Anki deck: one card per line of dialogue, with audio clipped straight from the episode and a vocabulary breakdown on the back. Portuguese or French → English.
+Turns a subtitle file into an Anki deck: one card per line of dialogue, with audio clipped straight from the episode and a vocabulary breakdown on the back. Portuguese, French or Russian → English.
 
 ## TL;DR
 
@@ -26,6 +26,7 @@ python3.13 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m spacy download pt_core_news_sm
 python -m spacy download fr_core_news_sm   # only for --source-lang fr
+python -m spacy download ru_core_news_sm   # only for --source-lang ru
 ```
 
 Then use `python run.py` anywhere this README says `./run.sh`.
@@ -51,12 +52,30 @@ Then use `python run.py` anywhere this README says `./run.sh`.
 | `--detect-offset` | off | Measure the audio/subtitle offset and use it. Requires `--audio` |
 | `--audio-offset <ms>` | `0` | Set the offset by hand. Positive = audio runs later than the subtitles |
 | `--audio-padding <ms>` | `100` | Buffer added to each end of a clip |
-| `--source-lang <pt\|fr>` | `pt` | Subtitle language |
+| `--source-lang <pt\|fr\|ru>` | `pt` | Subtitle language |
 | `--translation-srt <file>` | — | Take the English side from this subtitle file instead of the API |
 | `--no-translate` | off | Skip translation entirely. Fast, no network calls; card backs are empty |
 | `--keep-annotations` | off | Keep `[explosão distante]` / `[Sonic]` instead of filtering them out |
 | `--no-cache` | off | Ignore and don't write the translation cache |
 | `--tts <provider>` | `gtts` | Voice used when `--audio` is absent (see below) |
+
+### Vocabulary annotations
+
+The back of each card lists every verb, noun, adjective and adverb with its lemma, an English gloss, and the grammar that applies to the language:
+
+| | Portuguese / French | Russian |
+|---|---|---|
+| Nouns | gender as an article (`o carro`, `la maison`), plural | gender as a tag (`m.`/`f.`/`n.`), plural, **case** |
+| Adjectives | plural | plural, **case** |
+| Verbs | conjugation class, person, number, tense, mood | **aspect** (`impf.`/`perf.`), **reflexive**, conjugation class, person/number (gender in the past), tense, mood |
+
+```
+• собакой -> собака (noun, f., instr.)
+• написал -> написать (verb, perf., -ать, m. sing., past)
+• двигайся -> двигаться (verb, refl., impf., -ать, 2nd sing., imperative)
+```
+
+Diminutives are flagged where the suffix is unambiguous. The Russian list is deliberately short: `-ик`, `-ок` and `-ище` end ordinary nouns as often as diminutive ones (`ребёнок`, `чудовище`), and a wrong tag is worse than a missing one.
 
 ### How offset detection works
 
@@ -86,4 +105,6 @@ Used only when `--audio` isn't given. Per-language voices live in `LANGUAGE_CONF
 ELEVENLABS_API_KEY=your_key python run.py episode.srt --tts elevenlabs
 ```
 
-Optional overrides: `ELEVENLABS_VOICE_ID`, `ELEVENLABS_SPEED` (0.7–1.2, default 0.7), `POLLY_VOICE_ID`, `POLLY_SPEED` (`slow`/`medium`/`fast` or e.g. `75%`, default `slow`), `POLLY_LANGUAGE_CODE`.
+Optional overrides: `ELEVENLABS_VOICE_ID`, `ELEVENLABS_SPEED` (0.7–1.2, default 0.7), `POLLY_VOICE_ID`, `POLLY_SPEED` (`slow`/`medium`/`fast` or e.g. `75%`, default `slow`), `POLLY_LANGUAGE_CODE`, `POLLY_ENGINE`.
+
+Polly has no neural Russian voice, so `--source-lang ru --tts polly` uses the standard engine (Tatyana) automatically.
