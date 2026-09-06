@@ -449,6 +449,7 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
     chunk_size = 40
     card_counter = 0
     failed_sentences = []
+    missing_audio = []
 
     for i in range(0, len(all_pt_texts), chunk_size):
         chunk = all_pt_texts[i : i + chunk_size]
@@ -520,12 +521,17 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                             try:
                                 slice_audio(source_audio, timestamp[0], timestamp[1], audio_filepath, audio_padding, audio_offset)
                             except Exception as e:
-                                print(f"Audio slicing failed for card {card_counter}: {e}")
+                                print(f"Audio slicing failed for {audio_filename}: {e}")
                         else:
                             try:
                                 generate_audio(pt_sentence, audio_filepath, tts_provider, lang_config)
                             except Exception as e:
-                                print(f"Audio generation failed for card {card_counter}: {e}")
+                                print(f"Audio generation failed for {audio_filename}: {e}")
+
+                    # A [sound:] tag pointing at a file that was never written
+                    # is a silently broken card in Anki, so track it.
+                    if not os.path.exists(audio_filepath):
+                        missing_audio.append(audio_filename)
 
                     # 2. Extract Base Vocabulary with English definitions
                     vocab_list = []
@@ -605,7 +611,9 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                     anki_cards.append([front_of_card, back_of_card])
 
         except Exception as e:
-            print(f"Error translating batch: {e}")
+            batch_start = i + 1
+            batch_end = min(i + chunk_size, len(all_pt_texts))
+            print(f"Error processing cards {batch_start}-{batch_end}: {type(e).__name__}: {e}")
 
         print(f"Processed {min(i + chunk_size, len(all_pt_texts))}/{len(all_pt_texts)} cards...")
 
@@ -623,8 +631,23 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
     with open(output_filepath, "w", encoding="utf-8", newline="") as file:
         csv.writer(file, delimiter="\t").writerows(anki_cards)
 
+    try:
+        audio_on_disk = len([f for f in os.listdir(audio_dir) if f.endswith(".mp3")])
+    except OSError:
+        audio_on_disk = 0
+
     print(f"\nSaved {len(anki_cards)} cards to {output_filepath}")
-    print(f"Audio files in {audio_dir}: {card_counter}")
+    print(f"Audio files in {audio_dir}: {audio_on_disk}")
+
+    if missing_audio:
+        print(
+            f"\n{len(missing_audio)} cards reference audio that was not written; "
+            "they will play nothing in Anki."
+        )
+        for name in missing_audio[:5]:
+            print(f"  - {name}")
+        if len(missing_audio) > 5:
+            print(f"  ... and {len(missing_audio) - 5} more")
 
     if no_translate:
         print(
