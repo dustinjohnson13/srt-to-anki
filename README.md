@@ -2,6 +2,26 @@
 
 Converts SRT subtitle files into Anki flashcard decks with audio and vocabulary annotations. Designed for Brazilian Portuguese → English language learning.
 
+## TL;DR
+
+This command format works best:
+
+```bash
+./run.sh S01E01_PT-BR.srt --audio S01E01_PT-BR.mp3 --detect-offset
+```
+
+`--detect-offset` measures the alignment between the audio and the subtitles for you, so you don't have to guess `--audio-offset` by ear. Sound-effect-only subtitles (`[explosão distante]`) are skipped automatically, and speaker tags (`[Sonic]`) are stripped from the dialogue they precede.
+
+Two things worth knowing:
+
+- **Check the alignment first.** Add `--no-translate` for a fast pass that makes no network calls, then play a clip or two to confirm the audio lines up before committing to a full run:
+
+  ```bash
+  ./run.sh S01E01_PT-BR.srt --audio S01E01_PT-BR.mp3 --detect-offset --no-translate
+  ```
+
+- **Expect to re-run.** Google's free translation endpoint throttles heavily, so a long episode often won't translate in one pass. Successful translations are cached to `<name>_translations.json`, so re-running the same command picks up where it left off instead of starting over. Already-generated audio clips are skipped too.
+
 ## Setup
 
 ### Docker (recommended)
@@ -46,6 +66,7 @@ python run.py episode.srt --audio episode.mp3
 | `--audio <file>` | _(none)_ | Source audio file to extract clips from |
 | `--audio-padding <ms>` | `100` | Padding in ms added before/after each clip |
 | `--audio-offset <ms>` | `0` | Shift SRT timestamps to align with audio. Positive = audio starts later than SRT, negative = earlier |
+| `--detect-offset` | off | Measure the offset automatically and use it. Requires `--audio`. Falls back to `--audio-offset` if the estimate is low-confidence |
 
 ```bash
 # Custom padding (200ms buffer around each clip)
@@ -55,6 +76,32 @@ python run.py episode.srt --audio episode.mp3
 ./run.sh episode.srt --audio episode.mp3 --audio-offset 2000    # audio starts 2s after SRT
 ./run.sh episode.srt --audio episode.mp3 --audio-offset -1500   # audio starts 1.5s before SRT
 ```
+
+#### Detecting the offset automatically
+
+Rather than guessing `--audio-offset`, let the tool measure it:
+
+```bash
+./run.sh episode.srt --audio episode.mp3 --detect-offset
+```
+
+It builds a voice-activity signal from the audio and a second signal from the subtitle timings, then cross-correlates them to find the lag that lines them up:
+
+```
+Detecting audio offset...
+  peak correlation 0.159 (z=10.4), halves agree to 10 ms (1960, 1950)
+  Using detected offset: +1950 ms
+```
+
+The estimate is only used when it is confident — the correlation peak must stand well clear of the noise, and the offsets computed independently from each half of the file must agree. Otherwise it reports what it found and falls back to whatever `--audio-offset` you passed, rather than silently misaligning every clip.
+
+#### Other options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--no-translate` | off | Skip translation entirely. Fast, no network calls. Cards get Portuguese + audio and an empty back — useful for checking alignment |
+| `--keep-annotations` | off | Keep bracketed subtitle annotations (`[explosão distante]`, `[Sonic]`) instead of stripping them and skipping annotation-only lines |
+| `--no-cache` | off | Ignore and do not write the `<name>_translations.json` translation cache |
 
 ### TTS generation (no source audio)
 
