@@ -54,6 +54,12 @@ python run.py <srt-file> --audio <audio-file> --keep-annotations
 
 # Skip translation - fast, no network. Use to dial in --audio-offset first.
 python run.py <srt-file> --audio <audio-file> --audio-offset 3000 --no-translate
+
+# Detect the offset automatically instead of guessing
+python run.py <srt-file> --audio <audio-file> --detect-offset
+
+# Recommended first pass: detect the offset, skip translation, check by ear
+python run.py <srt-file> --audio <audio-file> --detect-offset --no-translate
 ```
 
 ## Project Structure
@@ -78,6 +84,7 @@ anki_stable/        # Python 3.13 venv (do not modify)
 - **Audio padding:** `--audio-padding` (default 100ms) adds buffer around each extracted clip
 - **Audio offset:** `--audio-offset` (default 0ms) shifts all SRT timestamps when slicing; positive = audio starts later, negative = earlier
 - **Annotation filter:** bracketed subtitle annotations are stripped by default. A block that is *only* annotation (`[explosao distante]`) is skipped entirely; a speaker/delivery tag prefixing real dialogue (`[Sonic] E tambem tem o Shadow.`) is removed and the dialogue kept. Pass `--keep-annotations` to disable
+- **Offset detection:** `--detect-offset` estimates `--audio-offset` automatically by building a voice-activity signal from the audio (frame energy above a rolling median, which suppresses music beds), building a second signal from the SRT spans, and FFT cross-correlating them. Confidence is gated on peak z-score >= 5 and <= 1000ms disagreement between the two halves of the file; a low-confidence result falls back to whatever `--audio-offset` was given. Uses every SRT span including annotation-only ones, since more spans mean more signal
 - **No-translate mode:** `--no-translate` skips all translation requests, producing Portuguese + audio cards with an empty back. Intended for iterating on `--audio-offset` without hitting the API
 - **Translation cache:** successful translations are written to `<base>_translations.json` after every batch and reused on later runs, so a throttled run resumes instead of restarting. `--no-cache` disables it
 - **Translation resilience:** `translate_with_retry()` retries with exponential backoff; `translate_chunk()` falls back to per-sentence requests when a batch fails or returns a mismatched line count, so one bad sentence costs one card rather than 40
@@ -92,13 +99,14 @@ anki_stable/        # Python 3.13 venv (do not modify)
 
 | Function | Purpose |
 |---|---|
+| `detect_audio_offset(source_audio, srt_spans, max_lag_ms, fps)` | Estimates the constant SRT/audio offset via VAD + FFT cross-correlation; returns `(offset_ms_or_None, stats)` |
 | `translate_with_retry(translator, text, tries, base_delay)` | Single translation with exponential-backoff retry; returns `None` on persistent failure |
 | `translate_chunk(translator, chunk)` | Batch translate with per-sentence fallback; returns a same-length list with `None` for failures |
 | `clean_text(text, strip_annotations=True)` | Strips `[source:...]` tags, HTML tags, bracketed annotations, stranded dialogue dashes; collapses whitespace |
 | `parse_srt_timestamp(line)` | Extracts `(start_ms, end_ms)` from SRT timestamp line |
 | `slice_audio(source_audio, start_ms, end_ms, output_path, padding_ms)` | Extracts a clip from loaded audio with configurable padding |
 | `generate_audio(text, filepath, provider)` | TTS audio generation via multiple providers |
-| `create_anki_deck(input_filepath, tts_provider, audio_source, audio_padding, audio_offset, keep_annotations, no_cache, no_translate)` | Main pipeline: parse → filter → translate → NLP → audio → TSV |
+| `create_anki_deck(input_filepath, tts_provider, audio_source, audio_padding, audio_offset, keep_annotations, no_cache, no_translate, detect_offset)` | Main pipeline: parse → filter → translate → NLP → audio → TSV |
 
 ## Dependencies
 

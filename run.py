@@ -123,6 +123,86 @@ def generate_audio(text, filepath, provider):
         raise ValueError(f"Unknown TTS provider: {provider}")
 
 
+def detect_audio_offset(source_audio, srt_spans, max_lag_ms=120000, fps=100):
+    """Estimate the constant offset between SRT timings and the audio track.
+
+    Builds a crude voice-activity signal from the audio (frame energy above a
+    rolling median, which suppresses steady music and ambience), builds a second
+    signal from the subtitle spans, and cross-correlates the two via FFT to find
+    the lag that lines them up.
+
+    Returns (offset_ms, stats_dict). offset_ms is None if no confident peak was
+    found. The returned offset uses the same sign convention as --audio-offset:
+    positive means the audio runs later than the SRT claims.
+    """
+    import numpy as np
+
+    sr = 8000
+    npf = sr // fps
+
+    mono = source_audio.set_channels(1).set_frame_rate(sr)
+    full_scale = float(1 << (8 * mono.sample_width - 1))
+    x = np.array(mono.get_array_of_samples(), dtype=np.float32) / full_scale
+    n = len(x) // npf
+    if n < fps * 30:
+        return None, {"reason": "audio too short to align"}
+
+    rms = np.sqrt((x[: n * npf].reshape(n, npf) ** 2).mean(axis=1)) + 1e-9
+    log_energy = np.log(rms)
+
+    # Subtract a rolling average so a loud music bed doesn't read as speech.
+    window = fps * 15
+    padded = np.pad(log_energy, (window // 2, window // 2), mode="edge")
+    floor = np.convolve(padded, np.ones(window) / window, mode="same")
+    floor = floor[window // 2 : window // 2 + n]
+    vad = (log_energy - floor > 0.35).astype(np.float32)
+
+    sub = np.zeros(n, dtype=np.float32)
+    for start_ms, end_ms in srt_spans:
+        a = int(start_ms / 1000 * fps)
+        b = int(end_ms / 1000 * fps)
+        if a < n:
+            sub[a : min(b, n)] = 1.0
+
+    if vad.max() == 0 or sub.max() == 0:
+        return None, {"reason": "no usable activity in audio or subtitles"}
+
+    def correlate(a, b, max_lag):
+        a = a - a.mean()
+        b = b - b.mean()
+        size = 1
+        while size < 2 * (len(a) + max_lag):
+            size *= 2
+        cc = np.fft.irfft(np.fft.rfft(a, size) * np.conj(np.fft.rfft(b, size)), size)
+        cc = np.concatenate([cc[-max_lag:], cc[: max_lag + 1]])
+        denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
+        return np.arange(-max_lag, max_lag + 1), cc / denom
+
+    max_lag = min(int(max_lag_ms / 1000 * fps), n - 1)
+    lags, cc = correlate(vad, sub, max_lag)
+    peak_i = int(cc.argmax())
+    offset_ms = int(round(lags[peak_i] / fps * 1000))
+    peak = float(cc[peak_i])
+    z = float((peak - cc.mean()) / (cc.std() or 1.0))
+
+    # Agreement between halves is the strongest cheap signal that the offset is
+    # genuinely constant rather than a spurious correlation peak.
+    half = n // 2
+    halves = []
+    for sl in (slice(0, half), slice(half, n)):
+        h_lags, h_cc = correlate(vad[sl], sub[sl], max_lag)
+        halves.append(int(round(h_lags[int(h_cc.argmax())] / fps * 1000)))
+
+    stats = {
+        "corr": peak,
+        "z": z,
+        "halves": halves,
+        "spread_ms": abs(halves[0] - halves[1]),
+    }
+    confident = z >= 5.0 and stats["spread_ms"] <= 1000
+    return (offset_ms if confident else None), stats
+
+
 def translate_with_retry(translator, text, tries=4, base_delay=2.0):
     """Translate one string, retrying with exponential backoff.
 
@@ -171,7 +251,7 @@ def translate_chunk(translator, chunk):
     return results
 
 
-def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False):
+def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False, detect_offset=False):
     base_name = os.path.splitext(input_filepath)[0]
     safe_base_name = os.path.basename(base_name).replace(" ", "")
     output_filepath = f"{base_name}_AnkiDeck.tsv"
@@ -217,9 +297,14 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
         print(f"Audio loaded: {len(source_audio) / 1000:.1f}s")
 
     all_entries = []  # list of (pt_text, timestamp_or_none)
+    all_srt_spans = []  # every span, unfiltered - used for offset detection
     annotation_only = 0
     for block in blocks:
         lines = block.split("\n")
+        if len(lines) >= 2:
+            span = parse_srt_timestamp(lines[1])
+            if span:
+                all_srt_spans.append(span)
         if len(lines) >= 3:
             raw = "\n".join(lines[2:])
             pt_text = clean_text(raw, strip_annotations=not keep_annotations)
@@ -235,6 +320,32 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
 
     all_pt_texts = [e[0] for e in all_entries]
     all_timestamps = [e[1] for e in all_entries]
+
+    if detect_offset:
+        if not source_audio:
+            print("--detect-offset requires --audio; skipping detection.")
+        elif not all_srt_spans:
+            print("No SRT timestamps found; skipping offset detection.")
+        else:
+            print("Detecting audio offset...")
+            detected, stats = detect_audio_offset(source_audio, all_srt_spans)
+            if "reason" in stats:
+                print(f"  Could not detect offset: {stats['reason']}")
+            else:
+                print(
+                    f"  peak correlation {stats['corr']:.3f} (z={stats['z']:.1f}), "
+                    f"halves agree to {stats['spread_ms']} ms {tuple(stats['halves'])}"
+                )
+            if detected is None:
+                print(
+                    f"  Low confidence - keeping --audio-offset {audio_offset} ms. "
+                    "Verify by ear before a full run."
+                )
+            else:
+                if audio_offset:
+                    print(f"  Overriding --audio-offset {audio_offset} ms")
+                audio_offset = detected
+                print(f"  Using detected offset: {audio_offset:+d} ms")
 
     print(f"Starting processing of {len(all_pt_texts)} blocks with audio generation...")
 
@@ -455,6 +566,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--detect-offset",
+        action="store_true",
+        help=(
+            "Automatically estimate --audio-offset by cross-correlating audio "
+            "energy against subtitle timings, and use the result. Requires --audio. "
+            "Falls back to --audio-offset if the estimate is low-confidence."
+        ),
+    )
+    parser.add_argument(
         "--no-translate",
         action="store_true",
         help=(
@@ -508,4 +628,5 @@ if __name__ == "__main__":
         keep_annotations=args.keep_annotations,
         no_cache=args.no_cache,
         no_translate=args.no_translate,
+        detect_offset=args.detect_offset,
     )
