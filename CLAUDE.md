@@ -1,129 +1,102 @@
 # srt-to-anki
 
-Converts SRT subtitle files into Anki flashcard decks with audio and vocabulary annotations. Designed for Portuguese → English language learning.
+Converts subtitle files into Anki flashcard decks with audio and vocabulary annotations. Portuguese or French → English.
 
-## Purpose
+Input: a `.srt` (or `.vtt`) subtitle file, optionally plus the episode audio.
+Output: `<name>_AnkiDeck.tsv` and `<name>_Audio/` (one numbered `.mp3` per card).
 
-Takes a `.srt` subtitle file as input and produces:
-- A `_AnkiDeck.tsv` file with Portuguese/English cards
-- An `_Audio/` directory of numbered `.mp3` files (one per sentence)
-
-Each card has:
-- **Front:** Portuguese sentence + `[sound:file.mp3]` tag
-- **Back:** English translation + annotated vocab list: nouns with gender articles (o/a), verbs with conjugation class (-ar/-er/-ir), tense, mood, and person, plural indicators, and diminutive/augmentative markers
+Cards are source sentence + `[sound:...]` on the front; English translation plus an annotated vocab list on the back (gender articles, verb conjugation class, tense/mood/person, plural, diminutive/augmentative).
 
 ## Setup
 
-### Docker (recommended)
+**Docker** — `./run.sh <srt> --audio <audio>` builds the image (Python 3.13, ffmpeg, both spacy models) and mounts inputs automatically.
+
+**Manual** — Python 3.13 plus `ffmpeg` on PATH:
 
 ```bash
-./run.sh <path-to-srt-file> --audio <path-to-audio-file>
-```
-
-The `run.sh` script builds a Docker image with all dependencies (Python 3.13, ffmpeg, spacy model) and runs the container, automatically mounting input files.
-
-### Manual
-
-```bash
-python3.13 -m venv anki_stable
-source anki_stable/bin/activate
+python3.13 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m spacy download pt_core_news_sm
+python -m spacy download fr_core_news_sm
 ```
-
-Requires `ffmpeg` installed on the system if using `--audio` (e.g. `brew install ffmpeg`).
 
 ## Running
 
 ```bash
-# Extract audio from source file (subs2srs-style)
-python run.py <srt-file> --audio <audio-file>
+# Recommended first pass: detect the offset, skip translation, verify by ear
+python run.py <srt> --audio <audio> --detect-offset --no-translate
 
-# Extract audio with custom padding (default: 100ms)
-python run.py <srt-file> --audio <audio-file> --audio-padding 200
+# Full run (re-run to resume; the cache carries progress forward)
+python run.py <srt> --audio <audio> --detect-offset
 
-# Apply an offset if audio and SRT timestamps are misaligned
-python run.py <srt-file> --audio <audio-file> --audio-offset 2000   # audio starts 2s after SRT
-python run.py <srt-file> --audio <audio-file> --audio-offset -1500  # audio starts 1.5s before SRT
+# Skip the API entirely using an English subtitle file
+python run.py <srt> --audio <audio> --detect-offset --translation-srt <en-srt>
 
-# Use TTS instead (original behavior)
-python run.py <srt-file> --tts gtts
-
-# Keep bracketed annotations ([explosao distante], [Sonic]) instead of stripping them
-python run.py <srt-file> --audio <audio-file> --keep-annotations
-
-# Skip translation - fast, no network. Use to dial in --audio-offset first.
-python run.py <srt-file> --audio <audio-file> --audio-offset 3000 --no-translate
-
-# Detect the offset automatically instead of guessing
-python run.py <srt-file> --audio <audio-file> --detect-offset
-
-# Recommended first pass: detect the offset, skip translation, check by ear
-python run.py <srt-file> --audio <audio-file> --detect-offset --no-translate
+# No source audio: synthesize with TTS
+python run.py <srt> --tts gtts
 ```
+
+See README.md for the full flag table.
 
 ## Project Structure
 
 ```
-run.py              # Entire application (single file)
-requirements.txt    # pip dependencies
-Dockerfile          # Python 3.13-slim + ffmpeg + all deps
-run.sh              # Docker build & run wrapper
-.dockerignore       # Excludes venv, git, output files from build
-README.md           # Setup instructions
-anki_stable/        # Python 3.13 venv (do not modify)
+run.py            # Entire application (single file)
+run.sh            # Docker build & run wrapper
+Dockerfile        # Python 3.13-slim + ffmpeg + pt/fr spacy models
+requirements.txt  # pip dependencies
+Portuguese/       # Standalone PT cheat sheets + their own generator scripts
+README.md         # User-facing docs
 ```
 
 ## Key Implementation Details
 
-- **Entry point:** `run.py` — single-file application
-- **Venv:** `anki_stable/` using Python 3.13; activate before running
-- **Docker:** `Dockerfile` + `run.sh` for containerized execution with all deps
-- **Languages:** `--source-lang` selects the source language from `LANGUAGE_CONFIGS` (`pt`, `fr`); **defaults to `fr`**. Target is English. Per-language spacy model, TTS voices, gender articles, and verb/diminutive suffixes live in that table
-- **Audio modes:** `--audio` extracts clips from a source file using SRT timestamps; otherwise falls back to TTS
-- **Audio padding:** `--audio-padding` (default 100ms) adds buffer around each extracted clip
-- **Audio offset:** `--audio-offset` (default 0ms) shifts all SRT timestamps when slicing; positive = audio starts later, negative = earlier
-- **Translation SRT:** `--translation-srt` supplies the English side from a second subtitle file instead of the API. Both files are parsed with the same annotation policy so they drop the same blocks; pairing is positional, so a file that annotates different events will misalign
-- **Annotation filter:** bracketed subtitle annotations are stripped by default. A block that is *only* annotation (`[explosao distante]`) is skipped entirely; a speaker/delivery tag prefixing real dialogue (`[Sonic] E tambem tem o Shadow.`) is removed and the dialogue kept. Pass `--keep-annotations` to disable
-- **Offset detection:** `--detect-offset` estimates `--audio-offset` automatically by building a voice-activity signal from the audio (frame energy above a rolling median, which suppresses music beds), building a second signal from the SRT spans, and FFT cross-correlating them. Confidence is gated on peak z-score >= 5 and <= 1000ms disagreement between the two halves of the file; a low-confidence result falls back to whatever `--audio-offset` was given. Uses every SRT span including annotation-only ones, since more spans mean more signal
-- **No-translate mode:** `--no-translate` skips all translation requests, producing Portuguese + audio cards with an empty back. Intended for iterating on `--audio-offset` without hitting the API
-- **Translation cache:** successful translations are written to `<base>_translations.json` after every batch and reused on later runs, so a throttled run resumes instead of restarting. `--no-cache` disables it
-- **Translation resilience:** `translate_with_retry()` retries with exponential backoff; `translate_chunk()` falls back to per-sentence requests when a batch fails or returns a mismatched line count, so one bad sentence costs one card rather than 40
-- **Audio numbering:** clips are numbered by position in the filtered SRT, so a sentence keeps the same filename across resumed runs
-- **Batch size:** 40 sentences per translation API call
-- **Rate limiting:** `time.sleep(1)` between batches to avoid throttling
-- **NLP model:** `pt_core_news_sm` (Spacy Portuguese Core News Small)
-- **Vocab filter:** Only VERB, NOUN, ADJ, ADV tokens extracted
-- **Deduplication:** `dict.fromkeys()` preserves order while deduplicating vocab
+- **Single file:** all logic lives in `run.py`; no package structure, no tests
+- **Languages:** `--source-lang` (default `pt`) selects an entry from `LANGUAGE_CONFIGS`, which holds the spacy model, gTTS lang/tld, translator source, gender articles, verb suffixes, TTS voices, and diminutive/augmentative suffixes. Target is always English. Adding a language means adding one entry there plus the spacy model to the Dockerfile
+- **Subtitle parsing:** `parse_subtitle_block()` locates the timestamp by scanning for `-->` rather than assuming a line index, so VTT (no cue ID, optional metadata) works alongside SRT
+- **Annotation filter:** bracketed annotations are stripped by default. A block that is *only* annotation (`[explosao distante]`) is skipped; a tag prefixing real dialogue (`[Sonic] E tambem tem o Shadow.`) is removed and the dialogue kept, along with any dialogue dash the removal strands. `--keep-annotations` disables this
+- **Audio modes:** `--audio` slices clips from a source file using subtitle timings; otherwise TTS synthesizes them. `--audio-padding` (default 100ms) buffers each clip; `--audio-offset` (default 0) shifts all timestamps, positive meaning the audio runs later
+- **Offset detection:** `--detect-offset` builds a voice-activity signal from the audio (frame energy above a rolling median, which suppresses music beds), builds a second from the subtitle spans, and FFT cross-correlates them. Gated on peak z-score >= 5 **and** <= 1000ms disagreement between the two halves of the file; a low-confidence result falls back to `--audio-offset`. Uses every span including annotation-only ones, since more spans mean more signal
+- **Translation sources,** in priority order: `--translation-srt` (a second subtitle file — both files are parsed with the same annotation policy so they drop the same blocks, but pairing is positional, so a file annotating different events will misalign), then `--no-translate` (empty backs), then the API
+- **Translation resilience:** `translate_with_retry()` retries with exponential backoff; `translate_chunk()` falls back to per-sentence requests on failure or line mismatch, so one bad sentence costs one card rather than 40
+- **Translation cache:** successful translations are written to `<name>_translations.json` after every batch and reused later, so a throttled run resumes. `--no-cache` disables it
+- **Audio numbering:** clips are numbered by position in the filtered subtitle list, so a sentence keeps its filename across resumed runs and existing clips can be skipped
+- **Batching:** 40 sentences per API call, `time.sleep(1)` between batches
+- **Vocab:** only VERB/NOUN/ADJ/ADV tokens; `dict.fromkeys()` dedupes while preserving order
 
-### `run.py` Functions
+## `run.py` Functions
 
 | Function | Purpose |
 |---|---|
-| `detect_audio_offset(source_audio, srt_spans, max_lag_ms, fps)` | Estimates the constant SRT/audio offset via VAD + FFT cross-correlation; returns `(offset_ms_or_None, stats)` |
-| `translate_with_retry(translator, text, tries, base_delay)` | Single translation with exponential-backoff retry; returns `None` on persistent failure |
-| `translate_chunk(translator, chunk)` | Batch translate with per-sentence fallback; returns a same-length list with `None` for failures |
-| `clean_text(text, strip_annotations=True)` | Strips `[source:...]` tags, HTML tags, bracketed annotations, stranded dialogue dashes; collapses whitespace |
-| `parse_srt_timestamp(line)` | Extracts `(start_ms, end_ms)` from SRT timestamp line |
-| `slice_audio(source_audio, start_ms, end_ms, output_path, padding_ms)` | Extracts a clip from loaded audio with configurable padding |
-| `generate_audio(text, filepath, provider)` | TTS audio generation via multiple providers |
-| `create_anki_deck(input_filepath, tts_provider, audio_source, audio_padding, audio_offset, keep_annotations, no_cache, no_translate, detect_offset)` | Main pipeline: parse → filter → translate → NLP → audio → TSV |
+| `parse_subtitle_block(block, strip_annotations)` | Parses one SRT/VTT block → `(text, timestamp)`, or `None` if it has no timestamp or no text left |
+| `parse_srt_texts(filepath, strip_annotations)` | Reads a whole subtitle file → list of cleaned texts (used for `--translation-srt`) |
+| `clean_text(text, strip_annotations)` | Strips `[source:...]`, HTML, bracketed annotations and stranded dialogue dashes; collapses whitespace |
+| `parse_srt_timestamp(line)` | `(start_ms, end_ms)` from a timestamp line |
+| `slice_audio(source_audio, start_ms, end_ms, output_path, padding_ms, offset_ms)` | Cuts one clip from loaded audio |
+| `generate_audio(text, filepath, provider, lang_config)` | TTS synthesis across the five providers |
+| `detect_audio_offset(source_audio, srt_spans, max_lag_ms, fps)` | Estimates the constant offset via VAD + FFT cross-correlation → `(offset_ms_or_None, stats)` |
+| `translate_with_retry(translator, text, tries, base_delay)` | One translation with backoff retry → `None` on persistent failure |
+| `translate_chunk(translator, chunk)` | Batch translate with per-sentence fallback → same-length list, `None` for failures |
+| `create_anki_deck(...)` | Main pipeline: parse → filter → detect offset → translate → NLP → audio → TSV |
 
 ## Dependencies
 
 | Package | Purpose |
 |---|---|
-| `deep-translator` | Google Translate API wrapper |
-| `spacy` | Portuguese NLP (POS tagging, lemmatization) |
-| `gTTS` | Google Text-to-Speech MP3 generation |
-| `pydub` | Audio slicing from source files (requires ffmpeg) |
+| `deep-translator` | Google Translate wrapper (free endpoint; throttles) |
+| `spacy` | POS tagging and lemmatization (`pt_core_news_sm`, `fr_core_news_sm`) |
+| `pydub` | Audio slicing (requires ffmpeg) |
+| `gTTS` | Default TTS |
+| `google-cloud-texttospeech`, `azure-cognitiveservices-speech`, `boto3`, `elevenlabs` | Optional TTS providers |
+
+`numpy` arrives via spacy and is imported lazily inside `detect_audio_offset()`.
 
 ## No Tests
 
-No test suite exists. Manual testing is done by running with a sample `.srt` file and importing the resulting `.tsv` into Anki.
+No test suite. Manual testing: run against a sample `.srt` and import the `.tsv` into Anki.
 
-## Known Limitations / Areas for Improvement
+## Known Limitations
 
-- No progress bar for large files
-- Google's free translation endpoint (via `deep-translator`) throttles aggressively; large decks often need several runs, with the cache carrying progress forward
-- No configuration file support
+- Google's free translation endpoint throttles aggressively; large decks usually need several runs, with the cache carrying progress forward
+- `--translation-srt` pairing is positional, so mismatched annotation blocks between the two files shift the alignment
+- No progress bar, no config file

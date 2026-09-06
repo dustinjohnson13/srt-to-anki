@@ -339,7 +339,7 @@ def translate_chunk(translator, chunk):
 
 
 
-def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False, detect_offset=False, translation_srt=None, source_lang="fr"):
+def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False, detect_offset=False, translation_srt=None, source_lang="pt"):
     base_name = os.path.splitext(input_filepath)[0]
     safe_base_name = os.path.basename(base_name).replace(" ", "")
     output_filepath = f"{base_name}_AnkiDeck.tsv"
@@ -649,8 +649,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--source-lang",
         choices=list(LANGUAGE_CONFIGS.keys()),
-        default="fr",
-        help="Source language of the subtitle file (default: fr). Supported: " + ", ".join(LANGUAGE_CONFIGS.keys()),
+        default="pt",
+        help="Source language of the subtitle file (default: pt). Supported: " + ", ".join(LANGUAGE_CONFIGS.keys()),
     )
     parser.add_argument(
         "--translation-srt",
