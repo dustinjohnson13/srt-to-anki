@@ -1,2 +1,10 @@
+*.mkv
+*.mp3
+*.mp4
+*.srt
+*_AnkiDeck.tsv
+*_Audio/
+*_translations.json
 .DS_Store
 .idea/
+__pycache__/

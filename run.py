@@ -1,4 +1,5 @@
 import csv
+import json
 import re
 import time
 import argparse
@@ -14,11 +15,22 @@ SRT_TIMESTAMP_RE = re.compile(
     r'(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})'
 )
 
+# Bracketed subtitle annotations: sound effects ([explosao distante]) and
+# speaker/delivery tags ([Sonic], [ecoa]). Stripped by default; a block that is
+# nothing but annotations is dropped rather than turned into a card.
+ANNOTATION_RE = re.compile(r'\[[^\]]*\]')
 
-def clean_text(text):
+
+def clean_text(text, strip_annotations=True):
     text = re.sub(r'\[source:[^\]]*\]', '', text)
     text = re.sub(r'<[^>]+>', '', text)
+    if strip_annotations:
+        text = ANNOTATION_RE.sub(' ', text)
     text = re.sub(r'\s+', ' ', text)
+    # A stripped annotation can strand dialogue dashes at either end
+    # ("- [risada]" or "Ta bem, Sonic. - [sapo coaxa]").
+    text = re.sub(r'^[\s\-\u2013\u2014]+', '', text)
+    text = re.sub(r'[\s\-\u2013\u2014]+$', '', text)
     return text.strip()
 
 
@@ -111,13 +123,73 @@ def generate_audio(text, filepath, provider):
         raise ValueError(f"Unknown TTS provider: {provider}")
 
 
-def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0):
+def translate_with_retry(translator, text, tries=4, base_delay=2.0):
+    """Translate one string, retrying with exponential backoff.
+
+    The free Google endpoint used by deep-translator throttles aggressively and
+    raises TranslationNotFound for arbitrary inputs when it does, so a single
+    attempt is not a reliable signal of failure.
+    """
+    delay = base_delay
+    for attempt in range(1, tries + 1):
+        try:
+            result = translator.translate(text)
+            if result:
+                return result
+        except Exception:
+            pass
+        if attempt < tries:
+            time.sleep(delay)
+            delay *= 2
+    return None
+
+
+def translate_chunk(translator, chunk):
+    """Translate a list of sentences, returning a same-length list.
+
+    Fast path joins the chunk with newlines in one request. If that request
+    fails or comes back with a different number of lines, fall back to
+    per-sentence translation so one bad sentence costs one card instead of the
+    whole batch. Untranslatable sentences come back as None.
+    """
+    joined = translate_with_retry(translator, "\n".join(chunk))
+    if joined:
+        lines = joined.split("\n")
+        if len(lines) == len(chunk):
+            return lines
+        print(
+            f"  Line mismatch (got {len(lines)}, expected {len(chunk)}); "
+            "falling back to per-sentence translation..."
+        )
+    else:
+        print("  Batch request failed; falling back to per-sentence translation...")
+
+    results = []
+    for sentence in chunk:
+        results.append(translate_with_retry(translator, sentence, tries=3))
+        time.sleep(0.3)
+    return results
+
+
+def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False):
     base_name = os.path.splitext(input_filepath)[0]
     safe_base_name = os.path.basename(base_name).replace(" ", "")
     output_filepath = f"{base_name}_AnkiDeck.tsv"
     audio_dir = f"{base_name}_Audio"
 
     os.makedirs(audio_dir, exist_ok=True)
+
+    # Translations are cached to disk so a throttled or interrupted run can be
+    # resumed without re-requesting sentences that already came back.
+    cache_filepath = f"{base_name}_translations.json"
+    translation_cache = {}
+    if not no_cache and os.path.exists(cache_filepath):
+        try:
+            with open(cache_filepath, "r", encoding="utf-8") as cf:
+                translation_cache = json.load(cf)
+            print(f"Loaded {len(translation_cache)} cached translations")
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Could not read translation cache ({e}); starting fresh.")
 
     for encoding in ("utf-8", "utf-8-sig", "latin-1"):
         try:
@@ -145,13 +217,21 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
         print(f"Audio loaded: {len(source_audio) / 1000:.1f}s")
 
     all_entries = []  # list of (pt_text, timestamp_or_none)
+    annotation_only = 0
     for block in blocks:
         lines = block.split("\n")
         if len(lines) >= 3:
-            pt_text = clean_text("\n".join(lines[2:]))
+            raw = "\n".join(lines[2:])
+            pt_text = clean_text(raw, strip_annotations=not keep_annotations)
             if pt_text:
                 timestamp = parse_srt_timestamp(lines[1]) if len(lines) >= 2 else None
                 all_entries.append((pt_text, timestamp))
+            elif clean_text(raw, strip_annotations=False):
+                # Had content, but it was purely bracketed annotation.
+                annotation_only += 1
+
+    if annotation_only:
+        print(f"Skipped {annotation_only} annotation-only blocks (sound effects, etc.)")
 
     all_pt_texts = [e[0] for e in all_entries]
     all_timestamps = [e[1] for e in all_entries]
@@ -161,17 +241,23 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
     anki_cards = []
     chunk_size = 40
     card_counter = 0
+    failed_sentences = []
 
     for i in range(0, len(all_pt_texts), chunk_size):
         chunk = all_pt_texts[i : i + chunk_size]
 
         try:
-            translated = translator.translate("\n".join(chunk))
-            en_texts = translated.split("\n")
-
-            if len(en_texts) != len(chunk):
-                print("Line mismatch in batch. Skipping chunk to prevent misaligned cards...")
+            if no_translate:
+                en_texts = [""] * len(chunk)
             else:
+                missing = [t for t in chunk if t not in translation_cache]
+                if missing:
+                    for src, dst in zip(missing, translate_chunk(translator, missing)):
+                        if dst:
+                            translation_cache[src] = dst
+                en_texts = [translation_cache.get(t) for t in chunk]
+
+            if True:
                 # NLP pass: batch-process all sentences and collect unique lemmas
                 sentence_docs = list(nlp.pipe(chunk, disable=["parser", "ner"]))
                 all_lemmas = list(dict.fromkeys(
@@ -182,20 +268,31 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                 ))
 
                 lemma_translations = {}
-                if all_lemmas:
-                    try:
-                        time.sleep(1)
-                        translated_lemmas = translator.translate("\n".join(all_lemmas))
+                if all_lemmas and not no_translate:
+                    time.sleep(1)
+                    translated_lemmas = translate_with_retry(translator, "\n".join(all_lemmas))
+                    if translated_lemmas:
                         en_lemmas = translated_lemmas.split("\n")
                         if len(en_lemmas) == len(all_lemmas):
                             lemma_translations = dict(zip(all_lemmas, en_lemmas))
-                    except Exception as e:
-                        print(f"Lemma translation failed: {e}")
+                        else:
+                            print("  Lemma line mismatch; vocab definitions omitted for this batch.")
+                    else:
+                        print("  Lemma translation failed; vocab definitions omitted for this batch.")
 
                 for j, (pt_sentence, en_sentence, doc) in enumerate(zip(chunk, en_texts, sentence_docs)):
-                    card_counter += 1
                     global_index = i + j
-                    audio_filename = f"{safe_base_name}_{str(card_counter).zfill(4)}.mp3"
+
+                    # No translation for this sentence: report it at the end
+                    # instead of discarding the surrounding batch.
+                    if en_sentence is None:
+                        failed_sentences.append(pt_sentence)
+                        continue
+
+                    card_counter += 1
+                    # Numbered by position in the SRT, not by card count, so a
+                    # sentence keeps the same filename across resumed runs.
+                    audio_filename = f"{safe_base_name}_{str(global_index + 1).zfill(4)}.mp3"
                     audio_filepath = os.path.join(audio_dir, audio_filename)
 
                     # 1. Generate Audio (skip if already exists)
@@ -285,8 +382,10 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
 
                     # 3. Format Card Sides
                     front_of_card = f"{pt_sentence} [sound:{audio_filename}]"
-                    if vocab_html:
+                    if vocab_html and en_sentence.strip():
                         back_of_card = f"{en_sentence.strip()}<br><br><hr><br><b>Base Vocabulary:</b><br>{vocab_html}"
+                    elif vocab_html:
+                        back_of_card = f"<b>Base Vocabulary:</b><br>{vocab_html}"
                     else:
                         back_of_card = en_sentence.strip()
 
@@ -296,12 +395,39 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
             print(f"Error translating batch: {e}")
 
         print(f"Processed {min(i + chunk_size, len(all_pt_texts))}/{len(all_pt_texts)} cards...")
-        time.sleep(1)
+
+        # Persist after every batch so an interrupted run keeps its progress.
+        if not no_cache and not no_translate and translation_cache:
+            try:
+                with open(cache_filepath, "w", encoding="utf-8") as cf:
+                    json.dump(translation_cache, cf, ensure_ascii=False, indent=1)
+            except OSError as e:
+                print(f"Could not write translation cache: {e}")
+
+        if not no_translate:
+            time.sleep(1)
 
     with open(output_filepath, "w", encoding="utf-8", newline="") as file:
         csv.writer(file, delimiter="\t").writerows(anki_cards)
 
-    print(f"Success! Saved TSV and generated {card_counter} audio files.")
+    print(f"\nSaved {len(anki_cards)} cards to {output_filepath}")
+    print(f"Audio files in {audio_dir}: {card_counter}")
+
+    if no_translate:
+        print(
+            "Translation was skipped (--no-translate): card backs are empty and "
+            "vocabulary has no English definitions."
+        )
+    if failed_sentences:
+        print(
+            f"\n{len(failed_sentences)} sentences had no translation and were skipped. "
+            "Google's free endpoint throttles heavily; re-run the same command later "
+            "and cached translations will be reused so only these are retried."
+        )
+        for t in failed_sentences[:5]:
+            print(f"  - {t}")
+        if len(failed_sentences) > 5:
+            print(f"  ... and {len(failed_sentences) - 5} more")
 
 
 if __name__ == "__main__":
@@ -329,6 +455,29 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--no-translate",
+        action="store_true",
+        help=(
+            "Skip translation entirely. Produces cards with Portuguese + audio and an "
+            "empty back. Makes no network requests, so it is fast and unthrottled - "
+            "useful for checking --audio-offset alignment before committing to a full run."
+        ),
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignore and do not write the *_translations.json cache.",
+    )
+    parser.add_argument(
+        "--keep-annotations",
+        action="store_true",
+        help=(
+            "Keep bracketed subtitle annotations such as [explosao distante] or "
+            "[Sonic]. By default these are stripped, and blocks consisting only of "
+            "annotations are skipped instead of becoming cards."
+        ),
+    )
+    parser.add_argument(
         "--tts",
         choices=["gtts", "google-cloud", "azure", "polly", "elevenlabs"],
         default="gtts",
@@ -350,4 +499,13 @@ if __name__ == "__main__":
         print("Error: Audio file not found.")
         sys.exit(1)
 
-    create_anki_deck(args.srt_file, args.tts, audio_source=args.audio, audio_padding=args.audio_padding, audio_offset=args.audio_offset)
+    create_anki_deck(
+        args.srt_file,
+        args.tts,
+        audio_source=args.audio,
+        audio_padding=args.audio_padding,
+        audio_offset=args.audio_offset,
+        keep_annotations=args.keep_annotations,
+        no_cache=args.no_cache,
+        no_translate=args.no_translate,
+    )

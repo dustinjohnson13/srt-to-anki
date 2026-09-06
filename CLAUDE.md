@@ -48,6 +48,12 @@ python run.py <srt-file> --audio <audio-file> --audio-offset -1500  # audio star
 
 # Use TTS instead (original behavior)
 python run.py <srt-file> --tts gtts
+
+# Keep bracketed annotations ([explosao distante], [Sonic]) instead of stripping them
+python run.py <srt-file> --audio <audio-file> --keep-annotations
+
+# Skip translation - fast, no network. Use to dial in --audio-offset first.
+python run.py <srt-file> --audio <audio-file> --audio-offset 3000 --no-translate
 ```
 
 ## Project Structure
@@ -71,6 +77,11 @@ anki_stable/        # Python 3.13 venv (do not modify)
 - **Audio modes:** `--audio` extracts clips from a source file using SRT timestamps; otherwise falls back to TTS
 - **Audio padding:** `--audio-padding` (default 100ms) adds buffer around each extracted clip
 - **Audio offset:** `--audio-offset` (default 0ms) shifts all SRT timestamps when slicing; positive = audio starts later, negative = earlier
+- **Annotation filter:** bracketed subtitle annotations are stripped by default. A block that is *only* annotation (`[explosao distante]`) is skipped entirely; a speaker/delivery tag prefixing real dialogue (`[Sonic] E tambem tem o Shadow.`) is removed and the dialogue kept. Pass `--keep-annotations` to disable
+- **No-translate mode:** `--no-translate` skips all translation requests, producing Portuguese + audio cards with an empty back. Intended for iterating on `--audio-offset` without hitting the API
+- **Translation cache:** successful translations are written to `<base>_translations.json` after every batch and reused on later runs, so a throttled run resumes instead of restarting. `--no-cache` disables it
+- **Translation resilience:** `translate_with_retry()` retries with exponential backoff; `translate_chunk()` falls back to per-sentence requests when a batch fails or returns a mismatched line count, so one bad sentence costs one card rather than 40
+- **Audio numbering:** clips are numbered by position in the filtered SRT, so a sentence keeps the same filename across resumed runs
 - **Batch size:** 40 sentences per translation API call
 - **Rate limiting:** `time.sleep(1)` between batches to avoid throttling
 - **NLP model:** `pt_core_news_sm` (Spacy Portuguese Core News Small)
@@ -81,11 +92,13 @@ anki_stable/        # Python 3.13 venv (do not modify)
 
 | Function | Purpose |
 |---|---|
-| `clean_text(text)` | Strips `[source:...]` tags, HTML tags, collapses whitespace |
+| `translate_with_retry(translator, text, tries, base_delay)` | Single translation with exponential-backoff retry; returns `None` on persistent failure |
+| `translate_chunk(translator, chunk)` | Batch translate with per-sentence fallback; returns a same-length list with `None` for failures |
+| `clean_text(text, strip_annotations=True)` | Strips `[source:...]` tags, HTML tags, bracketed annotations, stranded dialogue dashes; collapses whitespace |
 | `parse_srt_timestamp(line)` | Extracts `(start_ms, end_ms)` from SRT timestamp line |
 | `slice_audio(source_audio, start_ms, end_ms, output_path, padding_ms)` | Extracts a clip from loaded audio with configurable padding |
 | `generate_audio(text, filepath, provider)` | TTS audio generation via multiple providers |
-| `create_anki_deck(input_filepath, tts_provider, audio_source, audio_padding)` | Main pipeline: parse → translate → NLP → audio → TSV |
+| `create_anki_deck(input_filepath, tts_provider, audio_source, audio_padding, audio_offset, keep_annotations, no_cache, no_translate)` | Main pipeline: parse → filter → translate → NLP → audio → TSV |
 
 ## Dependencies
 
@@ -104,6 +117,5 @@ No test suite exists. Manual testing is done by running with a sample `.srt` fil
 
 - Languages are hardcoded (no CLI flags for source/target language)
 - No progress bar for large files
-- Silent error swallowing on failed audio/translation batches
-- Line mismatch in a translation batch causes the entire chunk to be skipped
+- Google's free translation endpoint (via `deep-translator`) throttles aggressively; large decks often need several runs, with the cache carrying progress forward
 - No configuration file support
