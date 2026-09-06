@@ -12,13 +12,93 @@ from gtts import gTTS
 VOCAB_POS = {"VERB", "NOUN", "ADJ", "ADV"}
 
 SRT_TIMESTAMP_RE = re.compile(
-    r'(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})'
+    r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})'
 )
 
 # Bracketed subtitle annotations: sound effects ([explosao distante]) and
 # speaker/delivery tags ([Sonic], [ecoa]). Stripped by default; a block that is
 # nothing but annotations is dropped rather than turned into a card.
 ANNOTATION_RE = re.compile(r'\[[^\]]*\]')
+
+
+LANGUAGE_CONFIGS = {
+    "pt": {
+        "spacy_model": "pt_core_news_sm",
+        "gtts_lang": "pt",
+        "gtts_tld": "com.br",
+        "translator_source": "pt",
+        "gender_articles": {"Masc": "o", "Fem": "a"},
+        "verb_suffixes": ["ar", "er", "ir"],
+        "tts_voices": {
+            "google-cloud": ("pt-BR", "pt-BR-Neural2-A"),
+            "azure": "pt-BR-FranciscaNeural",
+            "polly": ("Camila", "pt-BR"),
+        },
+        "diminutive_suffixes": [
+            ("inho", "dim."), ("inha", "dim."), ("inhos", "dim."), ("inhas", "dim."),
+            ("zinho", "dim."), ("zinha", "dim."), ("zinhos", "dim."), ("zinhas", "dim."),
+            ("ão", "aug."), ("ona", "aug."), ("ões", "aug."), ("onas", "aug."),
+            ("ito", "dim."), ("ita", "dim."),
+        ],
+    },
+    "fr": {
+        "spacy_model": "fr_core_news_sm",
+        "gtts_lang": "fr",
+        "gtts_tld": None,
+        "translator_source": "fr",
+        "gender_articles": {"Masc": "le", "Fem": "la"},
+        "verb_suffixes": ["er", "ir", "re", "oir"],
+        "tts_voices": {
+            "google-cloud": ("fr-FR", "fr-FR-Neural2-A"),
+            "azure": "fr-FR-DeniseNeural",
+            "polly": ("Lea", "fr-FR"),
+        },
+        "diminutive_suffixes": [
+            ("ette", "dim."), ("et", "dim."), ("eau", "dim."), ("ot", "dim."),
+        ],
+    },
+}
+
+
+def parse_subtitle_block(block, strip_annotations=True):
+    """Parse one subtitle block from SRT or VTT format.
+
+    Finds the timestamp line by scanning for '-->' rather than assuming a fixed
+    line index. This handles VTT blocks (no cue ID, optional positioning metadata)
+    as well as standard SRT blocks.
+
+    Returns (text, timestamp_ms_tuple_or_None), or None if the block has no
+    timestamp line (e.g. WEBVTT header, NOTE blocks).
+    """
+    lines = block.split("\n")
+    for i, line in enumerate(lines):
+        if "-->" in line:
+            timestamp = parse_srt_timestamp(line)
+            text = clean_text("\n".join(lines[i + 1:]), strip_annotations=strip_annotations)
+            return (text, timestamp) if text else None
+    return None
+
+
+def parse_srt_texts(filepath, strip_annotations=True):
+    """Parse an SRT or VTT file and return a list of cleaned subtitle texts in block order."""
+    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            with open(filepath, "r", encoding=encoding) as f:
+                content = f.read()
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    else:
+        print(f"Error: Could not decode translation SRT file.")
+        sys.exit(1)
+
+    texts = []
+    for block in content.strip().split("\n\n"):
+        result = parse_subtitle_block(block, strip_annotations=strip_annotations)
+        if result:
+            texts.append(result[0])
+    return texts
+
 
 
 def clean_text(text, strip_annotations=True):
@@ -53,18 +133,22 @@ def slice_audio(source_audio, start_ms, end_ms, output_path, padding_ms, offset_
     clip.export(output_path, format="mp3")
 
 
-def generate_audio(text, filepath, provider):
+def generate_audio(text, filepath, provider, lang_config):
     if provider == "gtts":
-        gTTS(text=text, lang="pt", tld="com.br", slow=False).save(filepath)
+        kwargs = {"text": text, "lang": lang_config["gtts_lang"], "slow": False}
+        if lang_config["gtts_tld"]:
+            kwargs["tld"] = lang_config["gtts_tld"]
+        gTTS(**kwargs).save(filepath)
 
     elif provider == "google-cloud":
         from google.cloud import texttospeech
         client = texttospeech.TextToSpeechClient()
+        lang_code, voice_name = lang_config["tts_voices"]["google-cloud"]
         response = client.synthesize_speech(
             input=texttospeech.SynthesisInput(text=text),
             voice=texttospeech.VoiceSelectionParams(
-                language_code="pt-BR",
-                name="pt-BR-Neural2-A",
+                language_code=lang_code,
+                name=voice_name,
             ),
             audio_config=texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.MP3
@@ -78,7 +162,7 @@ def generate_audio(text, filepath, provider):
         key = os.environ["AZURE_TTS_KEY"]
         region = os.environ["AZURE_TTS_REGION"]
         speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
-        speech_config.speech_synthesis_voice_name = "pt-BR-FranciscaNeural"
+        speech_config.speech_synthesis_voice_name = lang_config["tts_voices"]["azure"]
         audio_config = speechsdk.audio.AudioOutputConfig(filename=filepath)
         synthesizer = speechsdk.SpeechSynthesizer(
             speech_config=speech_config, audio_config=audio_config
@@ -90,7 +174,9 @@ def generate_audio(text, filepath, provider):
     elif provider == "polly":
         import boto3
         client = boto3.client("polly")
-        voice_id = os.environ.get("POLLY_VOICE_ID", "Camila")
+        default_voice, default_lang_code = lang_config["tts_voices"]["polly"]
+        voice_id = os.environ.get("POLLY_VOICE_ID", default_voice)
+        lang_code = os.environ.get("POLLY_LANGUAGE_CODE", default_lang_code)
         speed = os.environ.get("POLLY_SPEED", "slow")
         response = client.synthesize_speech(
             Text=f"<speak><prosody rate=\"{speed}\">{text}</prosody></speak>",
@@ -98,7 +184,7 @@ def generate_audio(text, filepath, provider):
             OutputFormat="mp3",
             VoiceId=voice_id,
             Engine="neural",
-            LanguageCode="pt-BR",
+            LanguageCode=lang_code,
         )
         with open(filepath, "wb") as f:
             f.write(response["AudioStream"].read())
@@ -251,7 +337,9 @@ def translate_chunk(translator, chunk):
     return results
 
 
-def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False, detect_offset=False):
+
+
+def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False, detect_offset=False, translation_srt=None, source_lang="fr"):
     base_name = os.path.splitext(input_filepath)[0]
     safe_base_name = os.path.basename(base_name).replace(" ", "")
     output_filepath = f"{base_name}_AnkiDeck.tsv"
@@ -283,11 +371,18 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
         print("Error: Could not decode SRT file with any supported encoding.")
         sys.exit(1)
 
-    blocks = content.strip().split("\n\n")
-    translator = GoogleTranslator(source="pt", target="en")
+    lang_config = LANGUAGE_CONFIGS[source_lang]
 
-    print("Loading Portuguese NLP model...")
-    nlp = spacy.load("pt_core_news_sm")
+    blocks = content.strip().split("\n\n")
+    translator = GoogleTranslator(source=lang_config["translator_source"], target="en")
+
+    preloaded_translations = None
+    if translation_srt:
+        preloaded_translations = parse_srt_texts(translation_srt, strip_annotations=not keep_annotations)
+        print(f"Loaded {len(preloaded_translations)} translations from {translation_srt}")
+
+    print(f"Loading {source_lang} NLP model ({lang_config['spacy_model']})...")
+    nlp = spacy.load(lang_config["spacy_model"])
 
     source_audio = None
     if audio_source:
@@ -296,24 +391,25 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
         source_audio = AudioSegment.from_file(audio_source)
         print(f"Audio loaded: {len(source_audio) / 1000:.1f}s")
 
-    all_entries = []  # list of (pt_text, timestamp_or_none)
+    all_entries = []  # list of (text, timestamp_or_none)
     all_srt_spans = []  # every span, unfiltered - used for offset detection
     annotation_only = 0
     for block in blocks:
-        lines = block.split("\n")
-        if len(lines) >= 2:
-            span = parse_srt_timestamp(lines[1])
-            if span:
-                all_srt_spans.append(span)
-        if len(lines) >= 3:
-            raw = "\n".join(lines[2:])
-            pt_text = clean_text(raw, strip_annotations=not keep_annotations)
-            if pt_text:
-                timestamp = parse_srt_timestamp(lines[1]) if len(lines) >= 2 else None
-                all_entries.append((pt_text, timestamp))
-            elif clean_text(raw, strip_annotations=False):
-                # Had content, but it was purely bracketed annotation.
-                annotation_only += 1
+        # Collect the raw span before any filtering: offset detection wants every
+        # timed event, including the sound effects we drop as cards.
+        for line in block.split("\n"):
+            if "-->" in line:
+                span = parse_srt_timestamp(line)
+                if span:
+                    all_srt_spans.append(span)
+                break
+
+        result = parse_subtitle_block(block, strip_annotations=not keep_annotations)
+        if result:
+            all_entries.append(result)
+        elif parse_subtitle_block(block, strip_annotations=False):
+            # Had content, but it was purely bracketed annotation.
+            annotation_only += 1
 
     if annotation_only:
         print(f"Skipped {annotation_only} annotation-only blocks (sound effects, etc.)")
@@ -358,7 +454,18 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
         chunk = all_pt_texts[i : i + chunk_size]
 
         try:
-            if no_translate:
+            if preloaded_translations is not None:
+                # Slice to len(chunk), not chunk_size: the final chunk is short,
+                # and a longer translation SRT would otherwise fail the length
+                # check and drop the whole last batch.
+                en_texts = preloaded_translations[i : i + len(chunk)]
+                if len(en_texts) < len(chunk):
+                    print(
+                        f"Translation SRT ran out after {len(preloaded_translations)} entries "
+                        f"but the source has {len(all_pt_texts)}; skipping remaining cards."
+                    )
+                    break
+            elif no_translate:
                 en_texts = [""] * len(chunk)
             else:
                 missing = [t for t in chunk if t not in translation_cache]
@@ -416,7 +523,7 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                                 print(f"Audio slicing failed for card {card_counter}: {e}")
                         else:
                             try:
-                                generate_audio(pt_sentence, audio_filepath, tts_provider)
+                                generate_audio(pt_sentence, audio_filepath, tts_provider, lang_config)
                             except Exception as e:
                                 print(f"Audio generation failed for card {card_counter}: {e}")
 
@@ -432,7 +539,7 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
 
                             if token.pos_ == "NOUN":
                                 gender = morph.get("Gender", "")
-                                article = "o" if gender == "Masc" else "a" if gender == "Fem" else ""
+                                article = lang_config["gender_articles"].get(gender, "")
                                 if article:
                                     lemma = f"{article} {lemma}"
                                 if morph.get("Number") == "Plur":
@@ -440,12 +547,10 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
 
                             elif token.pos_ == "VERB":
                                 # Conjugation class from lemma ending
-                                if lemma.endswith("ar"):
-                                    tags.append("-ar")
-                                elif lemma.endswith("er"):
-                                    tags.append("-er")
-                                elif lemma.endswith("ir"):
-                                    tags.append("-ir")
+                                for suffix in lang_config["verb_suffixes"]:
+                                    if lemma.endswith(suffix):
+                                        tags.append(f"-{suffix}")
+                                        break
                                 # Person and number
                                 person = morph.get("Person", "")
                                 number = morph.get("Number", "")
@@ -477,10 +582,7 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                             # Diminutive/augmentative detection
                             word_lower = token.text.lower()
                             if word_lower != lemma.lower():
-                                for suffix, label in [("inho", "dim."), ("inha", "dim."), ("inhos", "dim."), ("inhas", "dim."),
-                                                      ("zinho", "dim."), ("zinha", "dim."), ("zinhos", "dim."), ("zinhas", "dim."),
-                                                      ("ão", "aug."), ("ona", "aug."), ("ões", "aug."), ("onas", "aug."),
-                                                      ("ito", "dim."), ("ita", "dim.")]:
+                                for suffix, label in lang_config["diminutive_suffixes"]:
                                     if word_lower.endswith(suffix):
                                         tags.append(label)
                                         break
@@ -545,6 +647,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert an SRT subtitle file into an Anki flashcard deck.")
     parser.add_argument("srt_file")
     parser.add_argument(
+        "--source-lang",
+        choices=list(LANGUAGE_CONFIGS.keys()),
+        default="fr",
+        help="Source language of the subtitle file (default: fr). Supported: " + ", ".join(LANGUAGE_CONFIGS.keys()),
+    )
+    parser.add_argument(
+        "--translation-srt",
+        default=None,
+        help="SRT file containing pre-existing English translations. When provided, skips the translation API call.",
+    )
+    parser.add_argument(
         "--audio",
         default=None,
         help="Source audio file (MP3, WAV, etc.) to extract per-card clips from using SRT timestamps.",
@@ -578,7 +691,7 @@ if __name__ == "__main__":
         "--no-translate",
         action="store_true",
         help=(
-            "Skip translation entirely. Produces cards with Portuguese + audio and an "
+            "Skip translation entirely. Produces cards with source-language text + audio and an "
             "empty back. Makes no network requests, so it is fast and unthrottled - "
             "useful for checking --audio-offset alignment before committing to a full run."
         ),
@@ -619,6 +732,10 @@ if __name__ == "__main__":
         print("Error: Audio file not found.")
         sys.exit(1)
 
+    if args.translation_srt and not os.path.exists(args.translation_srt):
+        print("Error: Translation SRT file not found.")
+        sys.exit(1)
+
     create_anki_deck(
         args.srt_file,
         args.tts,
@@ -629,4 +746,6 @@ if __name__ == "__main__":
         no_cache=args.no_cache,
         no_translate=args.no_translate,
         detect_offset=args.detect_offset,
+        translation_srt=args.translation_srt,
+        source_lang=args.source_lang,
     )

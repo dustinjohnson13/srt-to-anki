@@ -79,10 +79,11 @@ anki_stable/        # Python 3.13 venv (do not modify)
 - **Entry point:** `run.py` — single-file application
 - **Venv:** `anki_stable/` using Python 3.13; activate before running
 - **Docker:** `Dockerfile` + `run.sh` for containerized execution with all deps
-- **Languages:** Hardcoded Portuguese source (`pt`), English target (`en`)
+- **Languages:** `--source-lang` selects the source language from `LANGUAGE_CONFIGS` (`pt`, `fr`); **defaults to `fr`**. Target is English. Per-language spacy model, TTS voices, gender articles, and verb/diminutive suffixes live in that table
 - **Audio modes:** `--audio` extracts clips from a source file using SRT timestamps; otherwise falls back to TTS
 - **Audio padding:** `--audio-padding` (default 100ms) adds buffer around each extracted clip
 - **Audio offset:** `--audio-offset` (default 0ms) shifts all SRT timestamps when slicing; positive = audio starts later, negative = earlier
+- **Translation SRT:** `--translation-srt` supplies the English side from a second subtitle file instead of the API. Both files are parsed with the same annotation policy so they drop the same blocks; pairing is positional, so a file that annotates different events will misalign
 - **Annotation filter:** bracketed subtitle annotations are stripped by default. A block that is *only* annotation (`[explosao distante]`) is skipped entirely; a speaker/delivery tag prefixing real dialogue (`[Sonic] E tambem tem o Shadow.`) is removed and the dialogue kept. Pass `--keep-annotations` to disable
 - **Offset detection:** `--detect-offset` estimates `--audio-offset` automatically by building a voice-activity signal from the audio (frame energy above a rolling median, which suppresses music beds), building a second signal from the SRT spans, and FFT cross-correlating them. Confidence is gated on peak z-score >= 5 and <= 1000ms disagreement between the two halves of the file; a low-confidence result falls back to whatever `--audio-offset` was given. Uses every SRT span including annotation-only ones, since more spans mean more signal
 - **No-translate mode:** `--no-translate` skips all translation requests, producing Portuguese + audio cards with an empty back. Intended for iterating on `--audio-offset` without hitting the API
@@ -123,7 +124,6 @@ No test suite exists. Manual testing is done by running with a sample `.srt` fil
 
 ## Known Limitations / Areas for Improvement
 
-- Languages are hardcoded (no CLI flags for source/target language)
 - No progress bar for large files
 - Google's free translation endpoint (via `deep-translator`) throttles aggressively; large decks often need several runs, with the cache carrying progress forward
 - No configuration file support

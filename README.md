@@ -1,23 +1,23 @@
 # srt-to-anki
 
-Converts SRT subtitle files into Anki flashcard decks with audio and vocabulary annotations. Designed for Brazilian Portuguese → English language learning.
+Converts SRT subtitle files into Anki flashcard decks with audio and vocabulary annotations. Designed for Brazilian Portuguese or French → English language learning.
 
 ## TL;DR
 
 This command format works best:
 
 ```bash
-./run.sh S01E01_PT-BR.srt --audio S01E01_PT-BR.mp3 --detect-offset
+./run.sh S01E01_PT-BR.srt --audio S01E01_PT-BR.mp3 --detect-offset --source-lang pt
 ```
 
-`--detect-offset` measures the alignment between the audio and the subtitles for you, so you don't have to guess `--audio-offset` by ear. Sound-effect-only subtitles (`[explosão distante]`) are skipped automatically, and speaker tags (`[Sonic]`) are stripped from the dialogue they precede.
+`--source-lang pt` is required — the default is French. `--detect-offset` measures the alignment between the audio and the subtitles for you, so you don't have to guess `--audio-offset` by ear. Sound-effect-only subtitles (`[explosão distante]`) are skipped automatically, and speaker tags (`[Sonic]`) are stripped from the dialogue they precede.
 
 Two things worth knowing:
 
 - **Check the alignment first.** Add `--no-translate` for a fast pass that makes no network calls, then play a clip or two to confirm the audio lines up before committing to a full run:
 
   ```bash
-  ./run.sh S01E01_PT-BR.srt --audio S01E01_PT-BR.mp3 --detect-offset --no-translate
+  ./run.sh S01E01_PT-BR.srt --audio S01E01_PT-BR.mp3 --detect-offset --no-translate --source-lang pt
   ```
 
 - **Expect to re-run.** Google's free translation endpoint throttles heavily, so a long episode often won't translate in one pass. Successful translations are cached to `<name>_translations.json`, so re-running the same command picks up where it left off instead of starting over. Already-generated audio clips are skipped too.
@@ -102,6 +102,8 @@ The estimate is only used when it is confident — the correlation peak must sta
 | `--no-translate` | off | Skip translation entirely. Fast, no network calls. Cards get Portuguese + audio and an empty back — useful for checking alignment |
 | `--keep-annotations` | off | Keep bracketed subtitle annotations (`[explosão distante]`, `[Sonic]`) instead of stripping them and skipping annotation-only lines |
 | `--no-cache` | off | Ignore and do not write the `<name>_translations.json` translation cache |
+| `--source-lang <lang>` | `fr` | Source language of the subtitles: `pt` or `fr` |
+| `--translation-srt <file>` | _(none)_ | Use a subtitle file for the English side instead of calling the translation API. Avoids throttling entirely |
 
 ### TTS generation (no source audio)
 
