@@ -237,3 +237,87 @@ class TestThrottling:
                              output_name="deck", no_cache=True,
                              rate_limit_give_up=1)
         assert len(read_tsv(deck)) == 50
+
+
+class TestThrottledRetry:
+    """The backoff must retry the SAME batch, not merely pause before the next one.
+
+    A single-batch run (a small --limit) has no "next batch", so a version that
+    only waits between batches never waits at all.
+    """
+
+    @pytest.fixture
+    def book(self, make_epub):
+        return make_epub([("chapter1.xhtml", "<p>Hello there.</p><p>Hello again.</p>")])
+
+    @pytest.fixture
+    def waits(self, monkeypatch):
+        recorded = []
+        original = run.RateLimiter.wait
+
+        def spy(self, sleeper=None):
+            recorded.append(self.delay)
+            return original(self, sleeper=lambda _d: None)
+
+        monkeypatch.setattr(run.RateLimiter, "wait", spy)
+        return recorded
+
+    def _flaky(self, failures, refused_direction):
+        """A translator refused `failures` times in one direction, then working."""
+        state = {"n": 0}
+
+        class Stub:
+            def __init__(self, source, target):
+                self.source, self.target = source, target
+
+            def translate(self, text):
+                if self.target == refused_direction:
+                    state["n"] += 1
+                    if state["n"] <= failures:
+                        raise TooMany()
+                if self.target == "pt":
+                    # Real Portuguese, so the spacy pass finds content words and
+                    # the gloss path is genuinely exercised.
+                    return "\n".join(f"O gato dorme. {l}" for l in text.split("\n"))
+                return "\n".join(f"<en>{l}" for l in text.split("\n"))
+
+        return Stub
+
+    def test_single_batch_waits_and_retries_until_it_succeeds(self, book, monkeypatch, waits):
+        monkeypatch.setattr(run, "GoogleTranslator", self._flaky(2, "pt"))
+        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+                             output_name="deck", no_cache=True, rate_limit_wait=1)
+        rows = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
+        assert len(rows) == 2, "cards should be produced once the throttle lifts"
+        assert len(waits) >= 2, "the run must actually wait between attempts"
+
+    def test_backoff_escalates_between_retries(self, book, monkeypatch, waits):
+        monkeypatch.setattr(run, "GoogleTranslator", self._flaky(3, "pt"))
+        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+                             output_name="deck", no_cache=True, rate_limit_wait=10)
+        assert waits[:3] == [10, 20, 40]
+
+    def test_glosses_are_retried_not_abandoned_on_first_refusal(self, book, monkeypatch, waits):
+        monkeypatch.setattr(run, "GoogleTranslator", self._flaky(2, "en"))
+        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+                             output_name="deck", no_cache=True, rate_limit_wait=1)
+        deck = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
+        assert any("(<en>" in row[1] for row in deck), "glosses should arrive after the retry"
+
+    def test_gloss_retries_honour_the_configured_give_up(self, book, monkeypatch, waits):
+        """The limiter used to be rebuilt per batch with default settings."""
+        monkeypatch.setattr(run, "GoogleTranslator", self._flaky(999, "en"))
+        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+                             output_name="deck", no_cache=True,
+                             rate_limit_wait=1, rate_limit_give_up=3)
+        # Two waits, then the third refusal exhausts it.
+        assert len(waits) == 2
+        rows = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
+        assert len(rows) == 2, "cards survive even when glosses are given up on"
+
+    def test_no_empty_deck_is_written_when_nothing_translated(self, book, monkeypatch, waits):
+        monkeypatch.setattr(run, "GoogleTranslator", self._flaky(999, "pt"))
+        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+                             output_name="deck", no_cache=True,
+                             rate_limit_wait=1, rate_limit_give_up=2)
+        assert not os.path.exists(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))

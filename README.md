@@ -133,9 +133,9 @@ The estimate is used only when it's confident: the correlation peak must stand c
 
 ### When Google throttles you
 
-The free endpoint returns a bare `429` with no `Retry-After` and no rate-limit headers, so there is nothing to read that says when to come back. The script therefore paces itself: a refusal is recognised immediately rather than retried into (which only prolongs the block), the next batch waits 60s, then 120s, 240s and so on up to 10 minutes with a little jitter, and after five consecutive refusals it stops and tells you to re-run later.
+The free endpoint returns a bare `429` with no `Retry-After` and no rate-limit headers, so there is nothing to read that says when to come back. The script therefore paces itself: a refusal is recognised immediately rather than retried into (which only prolongs the block), then the same batch is retried after 60s, then 120s, 240s and so on up to 10 minutes with a little jitter, and after five consecutive refusals it stops and tells you to re-run later. Raise `--rate-limit-wait` and `--rate-limit-give-up` to sit out a longer block.
 
-Vocabulary definitions are treated separately from sentences. Losing a sentence loses a card, so that ends the run; losing a definition only loses the English gloss, so it stops asking and still writes the deck. And a run that ends throttled will never overwrite a larger existing deck with a partial one.
+Vocabulary definitions are treated separately from sentences. Losing a sentence loses a card, so that ends the run; losing a definition only loses the English gloss, so it stops asking and still writes the deck. A run that ends throttled will never overwrite a larger existing deck with a partial one, and one that produced no cards at all writes nothing.
 
 ## Tests
 

@@ -1064,6 +1064,9 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
     card_counter = 0
     failed_sentences = []
     limiter = RateLimiter(base_delay=rate_limit_wait, give_up_after=rate_limit_give_up)
+    # Definitions get their own counter: being refused them must not push the
+    # sentence path toward aborting the run.
+    lemma_limiter = RateLimiter(base_delay=rate_limit_wait, give_up_after=rate_limit_give_up)
     # Vocabulary definitions are optional garnish; sentences are not. Being
     # throttled on definitions costs nothing but the definitions, so it stops
     # asking rather than stopping the run.
@@ -1073,16 +1076,6 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
 
     for i in range(0, len(all_source_texts), chunk_size):
         chunk = all_source_texts[i : i + chunk_size]
-
-        if limiter.throttled and not no_translate and preloaded_translations is None:
-            if limiter.exhausted:
-                print(
-                    f"\nStopping after {limiter.consecutive} consecutive rate-limit refusals. "
-                    "Progress is cached; re-run the same command later to continue."
-                )
-                aborted = True
-                break
-            limiter.wait()
 
         try:
             if preloaded_translations is not None:
@@ -1100,10 +1093,23 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                 en_texts = [""] * len(chunk)
             else:
                 missing = [t for t in chunk if t not in translation_cache]
-                if missing:
+                while missing:
                     for src, dst in zip(missing, translate_chunk(translator, missing, limiter)):
                         if dst:
                             translation_cache[src] = dst
+                    missing = [t for t in missing if t not in translation_cache]
+                    # Only a rate-limit refusal is worth waiting on; anything
+                    # else has already exhausted its own retries.
+                    if not missing or not limiter.throttled:
+                        break
+                    if limiter.exhausted:
+                        print(
+                            f"\nStopping after {limiter.consecutive} consecutive rate-limit refusals. "
+                            "Progress is cached; re-run the same command later to continue."
+                        )
+                        aborted = True
+                        break
+                    limiter.wait()
                 en_texts = [translation_cache.get(t) for t in chunk]
 
             # The study language is what gets spacy, TTS and the vocab pass;
@@ -1128,26 +1134,29 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                 lemma_translations = {}
                 if all_lemmas and not no_translate and not skip_lemmas:
                     unknown = [l for l in all_lemmas if l not in lemma_cache]
-                    if unknown:
+                    while unknown:
                         time.sleep(1)
-                        lemma_limiter = RateLimiter()
                         translated_lemmas = translate_with_retry(
                             lemma_translator, "\n".join(unknown), limiter=lemma_limiter
                         )
-                        if lemma_limiter.throttled:
-                            skip_lemmas = True
-                            print(
-                                "  Rate limited on vocabulary definitions; skipping them for the "
-                                "rest of this run. Cards are unaffected apart from the glosses."
-                            )
                         if translated_lemmas:
                             en_lemmas = translated_lemmas.split("\n")
                             if len(en_lemmas) == len(unknown):
                                 lemma_cache.update(zip(unknown, en_lemmas))
                             else:
                                 print("  Lemma line mismatch; vocab definitions omitted for this batch.")
-                        else:
+                            break
+                        if not lemma_limiter.throttled:
                             print("  Lemma translation failed; vocab definitions omitted for this batch.")
+                            break
+                        if lemma_limiter.exhausted:
+                            skip_lemmas = True
+                            print(
+                                "  Rate limited on vocabulary definitions; skipping them for the "
+                                "rest of this run. Cards are unaffected apart from the glosses."
+                            )
+                            break
+                        lemma_limiter.wait()
                     lemma_translations = {l: lemma_cache[l] for l in all_lemmas if l in lemma_cache}
 
                 for j, (study_sentence, known_sentence, doc) in enumerate(zip(study_texts, known_texts, sentence_docs)):
@@ -1243,6 +1252,10 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
             )
             print("Caches are saved; re-run the same command to continue where this left off.")
             return
+
+    if not anki_cards and (aborted or limiter.throttled):
+        print("\nNo cards were produced. Nothing written; re-run later to retry.")
+        return
 
     with open(output_filepath, "w", encoding="utf-8", newline="") as file:
         csv.writer(file, delimiter="\t").writerows(anki_cards)
