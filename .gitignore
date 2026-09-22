@@ -1,3 +1,6 @@
+*.epub
+*.mobi
+*.pdf
 *.mkv
 *.mp3
 *.mp4
@@ -6,6 +9,7 @@
 *_AnkiDeck.tsv
 *_Audio/
 *_translations.json
+*_lemmas.json
 .DS_Store
 .idea/
 .venv/
@@ -13,3 +17,4 @@ __pycache__/
 anki_stable/
 offset_probe/
 venv/
+.pytest_cache/

@@ -4,8 +4,22 @@ import re
 import time
 import argparse
 import os
+import random
 import sys
+import html
+import hashlib
+import posixpath
+import struct
+import unicodedata
+import zipfile
+from html.parser import HTMLParser
+from xml.etree import ElementTree as ET
 from deep_translator import GoogleTranslator
+
+try:
+    from deep_translator.exceptions import TooManyRequests
+except ImportError:  # older deep-translator
+    TooManyRequests = None
 import spacy
 from gtts import gTTS
 
@@ -47,12 +61,29 @@ LANGUAGE_CONFIGS = {
             "azure": "pt-BR-FranciscaNeural",
             "polly": ("Camila", "pt-BR"),
         },
+        # spacy does not lemmatise "gatinho" back to "gato" -- a Portuguese
+        # diminutive is its own lexeme to the tagger -- so the suffix is
+        # matched on the lemma, as for Russian.
+        "diminutive_match": "lemma",
+        # Deliberately short. Augmentatives are not detected at all: -ão ends
+        # thousands of ordinary nouns (every -ção and -são), so "coração" and
+        # "informação" would be tagged as augmentations of nothing, and a
+        # wrong tag is worse than a missing one. -ito/-ita are dropped for the
+        # same reason ("muito", "direito", "visita").
         "diminutive_suffixes": [
-            ("inho", "dim."), ("inha", "dim."), ("inhos", "dim."), ("inhas", "dim."),
             ("zinho", "dim."), ("zinha", "dim."), ("zinhos", "dim."), ("zinhas", "dim."),
-            ("ão", "aug."), ("ona", "aug."), ("ões", "aug."), ("onas", "aug."),
-            ("ito", "dim."), ("ita", "dim."),
+            ("inho", "dim."), ("inha", "dim."), ("inhos", "dim."), ("inhas", "dim."),
         ],
+        # Ordinary words that merely happen to end in -inho/-inha. Not
+        # exhaustive -- a precision aid for the frequent ones.
+        "diminutive_exceptions": {
+            "caminho", "vinho", "vizinho", "vizinha", "carinho", "ninho",
+            "moinho", "pinho", "linho", "sozinho", "espinho", "padrinho",
+            "sobrinho", "focinho", "golfinho", "adivinho",
+            "linha", "farinha", "rainha", "galinha", "cozinha", "campainha",
+            "bainha", "marinha", "andorinha", "sardinha", "minha", "vinha",
+            "tinha",
+        },
     },
     "fr": {
         "spacy_model": "fr_core_news_sm",
@@ -66,9 +97,11 @@ LANGUAGE_CONFIGS = {
             "azure": "fr-FR-DeniseNeural",
             "polly": ("Lea", "fr-FR"),
         },
-        "diminutive_suffixes": [
-            ("ette", "dim."), ("et", "dim."), ("eau", "dim."), ("ot", "dim."),
-        ],
+        # Disabled. French diminutives are barely productive, while -ette,
+        # -et, -eau and -ot end a very large number of ordinary nouns
+        # ("recette", "objet", "bureau", "mot"). Detecting them by suffix
+        # mislabels far more words than it catches.
+        "diminutive_suffixes": [],
     },
     "ru": {
         "spacy_model": "ru_core_news_sm",
@@ -172,6 +205,259 @@ def parse_srt_timestamp(line):
     start_ms = parts[0] * 3600000 + parts[1] * 60000 + parts[2] * 1000 + parts[3]
     end_ms = parts[4] * 3600000 + parts[5] * 60000 + parts[6] * 1000 + parts[7]
     return (start_ms, end_ms)
+
+
+BOOK_EXTENSIONS = {".epub", ".mobi", ".azw", ".prc"}
+
+# Spine documents whose names mark front/back matter rather than body text.
+FRONT_MATTER_RE = re.compile(
+    r"(cover|title|toc|contents|copyright|dedication|newsletter|author|"
+    r"endpaper|frontmatter|backmatter|colophon|acknowledg|part\d+|"
+    r"fmtext|halftitle|epigraph|praise|alsoby|imprint|promo|advert)",
+    re.I,
+)
+
+# Content-level front/back matter. Formats without section names (MOBI) have
+# nothing else to go on, so the same patterns are matched against the text.
+BOILERPLATE_RE = re.compile(
+    r"(^\s*e?ISBN\b|Produced by|First Edition:|First e-?[Bb]ook Edition|"
+    r"All rights reserved|^www\.|macmillan|^Table of Contents$|^Begin Reading$|"
+    r"^Start$|Thank you for buying|^Photos by)",
+    re.I,
+)
+
+BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "li"}
+
+# Blocks that an unclosed sibling implicitly ends.
+SELF_CLOSING_BLOCKS = {"p", "li"}
+
+# A block not ending in one of these continues into the next block.
+TERMINAL_PUNCT = tuple(".!?:…\"'”’)")
+
+
+class _BlockExtractor(HTMLParser):
+    """Collects the text of each block-level element as a single string."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks = []
+        self._depth = 0
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in SELF_CLOSING_BLOCKS and self._depth:
+            # HTMLParser does not imply end tags, and sloppy ebook markup
+            # leaves <p> unclosed. Without this the rest of the document
+            # accumulates into one enormous block.
+            self._flush()
+        elif tag in BLOCK_TAGS:
+            # Nested blocks (a <p> inside a <blockquote>) flush as one block.
+            self._depth += 1
+        elif tag == "br" and self._depth:
+            self._buf.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in BLOCK_TAGS and self._depth:
+            self._depth -= 1
+            if self._depth == 0:
+                self._flush()
+
+    def handle_data(self, data):
+        if self._depth:
+            self._buf.append(data)
+
+    def _flush(self):
+        text = re.sub(r"\s+", " ", "".join(self._buf)).strip()
+        if text:
+            self.blocks.append(text)
+        self._buf = []
+
+    def close(self):
+        super().close()
+        if self._depth:
+            self._flush()
+
+
+def extract_html_blocks(html_text):
+    """Block-level text of an HTML fragment, in document order."""
+    parser = _BlockExtractor()
+    try:
+        parser.feed(html_text)
+        parser.close()
+        return parser.blocks
+    except Exception:
+        # Malformed markup shouldn't cost us the whole document.
+        return [
+            re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", m.group(2)))).strip()
+            for m in re.finditer(r"<(p|h[1-6])[^>]*>(.*?)</\1>", html_text, re.S | re.I)
+        ]
+
+
+def parse_epub(filepath):
+    """Read an EPUB in spine order -> [(section_name, text), ...]."""
+    out = []
+    with zipfile.ZipFile(filepath) as z:
+        container = ET.fromstring(z.read("META-INF/container.xml"))
+        rootfile = container.find(
+            ".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile"
+        )
+        if rootfile is None:
+            raise ValueError("EPUB has no rootfile in META-INF/container.xml")
+        opf_path = rootfile.get("full-path")
+        opf = ET.fromstring(z.read(opf_path))
+        ns = {"o": "http://www.idpf.org/2007/opf"}
+        base = posixpath.dirname(opf_path)
+        manifest = {
+            item.get("id"): item.get("href")
+            for item in opf.findall(".//o:manifest/o:item", ns)
+        }
+        # The spine is reading order; zip entry order is arbitrary.
+        for itemref in opf.findall(".//o:spine/o:itemref", ns):
+            href = manifest.get(itemref.get("idref"))
+            if not href:
+                continue
+            full = posixpath.normpath(posixpath.join(base, href.split("#")[0]))
+            try:
+                raw = z.read(full).decode("utf-8", "replace")
+            except KeyError:
+                continue
+            body = re.search(r"<body[^>]*>(.*)</body>", raw, re.S | re.I)
+            section = posixpath.basename(full)
+            for text in extract_html_blocks(body.group(1) if body else raw):
+                out.append((section, text))
+    return out
+
+
+def _palmdoc_decompress(data):
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        c = data[i]
+        i += 1
+        if c == 0:
+            out.append(0)
+        elif c <= 8:
+            out += data[i : i + c]
+            i += c
+        elif c <= 0x7F:
+            out.append(c)
+        elif c <= 0xBF:
+            if i >= n:
+                break
+            c = (c << 8) | data[i]
+            i += 1
+            dist = (c >> 3) & 0x07FF
+            length = (c & 7) + 3
+            if not 0 < dist <= len(out):
+                break
+            for _ in range(length):
+                out.append(out[-dist])
+        else:
+            out.append(32)
+            out.append(c ^ 0x80)
+    return bytes(out)
+
+
+def _mobi_trailing_size(data, flags):
+    """Bytes of per-record trailing metadata that are not text."""
+    num = 0
+    for bit in (16, 8, 4, 2):
+        if flags & bit:
+            value = 0
+            end = len(data) - num
+            # A backwards-encoded varint sits at the end of the record.
+            for k in range(max(0, end - 4), end):
+                byte = data[k]
+                if byte & 0x80:
+                    value = 0
+                value = (value << 7) | (byte & 0x7F)
+            num += value
+    if flags & 1:
+        num += (data[len(data) - num - 1] & 0x3) + 1
+    return num
+
+
+def parse_mobi(filepath):
+    """Read a MOBI/PalmDOC ebook -> [(section_name, text), ...]."""
+    with open(filepath, "rb") as f:
+        raw = f.read()
+    record_count = struct.unpack(">H", raw[76:78])[0]
+    offsets = [
+        struct.unpack(">I", raw[78 + i * 8 : 82 + i * 8])[0] for i in range(record_count)
+    ]
+    offsets.append(len(raw))
+    rec0 = raw[offsets[0] : offsets[1]]
+    compression, _, text_len, text_records, _, _ = struct.unpack(">HHIHHI", rec0[:16])
+    mobi_header_len = struct.unpack(">I", rec0[20:24])[0]
+    # "Extra data flags" mark trailing bytes that must be stripped from each
+    # record before decompression, or the decoder walks off the end.
+    flags = struct.unpack(">H", rec0[0xF2:0xF4])[0] if mobi_header_len >= 0xE4 else 0
+    body = bytearray()
+    for i in range(1, text_records + 1):
+        chunk = raw[offsets[i] : offsets[i + 1]]
+        chunk = chunk[: len(chunk) - _mobi_trailing_size(chunk, flags)]
+        body += _palmdoc_decompress(chunk) if compression == 2 else chunk
+    text = bytes(body)[:text_len].decode("utf-8", "replace")
+    section = os.path.basename(filepath)
+    return [(section, t) for t in extract_html_blocks(text)]
+
+
+def parse_book(filepath):
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".epub":
+        return parse_epub(filepath)
+    if ext in (".mobi", ".azw", ".prc"):
+        return parse_mobi(filepath)
+    raise ValueError(f"Unsupported ebook format: {ext}")
+
+
+def filter_book_blocks(blocks, keep_front_matter=False):
+    """Drop the TOC, copyright page, newsletter ad and similar matter."""
+    kept = []
+    for section, text in blocks:
+        if not keep_front_matter and (
+            FRONT_MATTER_RE.search(section) or BOILERPLATE_RE.search(text)
+        ):
+            continue
+        kept.append(text)
+    return kept
+
+
+def merge_fragments(texts, max_chars=600):
+    """Join mid-sentence fragments into whole sentences.
+
+    Books break sentences across lines for rhythm ("To push back-"), and a
+    fragment translated on its own is nonsense. A block that does not end in
+    terminal punctuation continues into the next one. ALL-CAPS headings also
+    lack punctuation but stand alone, so they are never merged.
+    """
+    merged = []
+    buf = ""
+    for text in texts:
+        if text.isupper():
+            if buf:
+                merged.append(buf)
+                buf = ""
+            merged.append(text)
+            continue
+        candidate = f"{buf} {text}".strip() if buf else text
+        if text.rstrip().endswith(TERMINAL_PUNCT) or len(candidate) >= max_chars:
+            merged.append(candidate)
+            buf = ""
+        else:
+            buf = candidate
+    if buf:
+        merged.append(buf)
+    return merged
+
+
+def slugify(name, max_len=60):
+    """A filesystem- and Anki-safe base name from an arbitrary book title."""
+    name = unicodedata.normalize("NFKD", name)
+    name = "".join(c for c in name if not unicodedata.combining(c))
+    name = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower()
+    return name[:max_len].strip("-") or "deck"
 
 
 def slice_audio(source_audio, start_ms, end_ms, output_path, padding_ms, offset_ms=0):
@@ -340,28 +626,89 @@ def detect_audio_offset(source_audio, srt_spans, max_lag_ms=120000, fps=100):
     return (offset_ms if confident else None), stats
 
 
-def translate_with_retry(translator, text, tries=4, base_delay=2.0):
+def is_rate_limited(exc):
+    """Whether an exception is the endpoint refusing us for rate reasons."""
+    if TooManyRequests is not None and isinstance(exc, TooManyRequests):
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return "too many requests" in text or "toomanyrequests" in text or "429" in text
+
+
+class RateLimiter:
+    """Paces requests against an endpoint that throttles without saying for how long.
+
+    Google's free translation endpoint answers a throttled request with a bare
+    429: no Retry-After, no RateLimit-* headers. There is therefore no
+    server-supplied delay to honour, and retrying straight into the block only
+    seems to prolong it. So the strategy is an escalating, jittered, capped
+    wait between batches, plus a limit on how many consecutive refusals to
+    absorb before stopping and letting the caches carry progress to a later run.
+    """
+
+    def __init__(self, base_delay=60.0, cap=600.0, give_up_after=5):
+        self.base_delay = base_delay
+        self.cap = cap
+        self.give_up_after = give_up_after
+        self.consecutive = 0
+
+    @property
+    def throttled(self):
+        return self.consecutive > 0
+
+    @property
+    def exhausted(self):
+        return self.consecutive >= self.give_up_after
+
+    @property
+    def delay(self):
+        return min(self.base_delay * (2 ** (self.consecutive - 1)), self.cap)
+
+    def record_limit(self):
+        self.consecutive += 1
+
+    def record_success(self):
+        self.consecutive = 0
+
+    def wait(self, sleeper=None):
+        # Jitter keeps repeated runs from retrying in lockstep.
+        delay = self.delay * random.uniform(0.8, 1.2)
+        print(
+            f"  Rate limited. Waiting {delay:.0f}s before retrying "
+            f"({self.consecutive}/{self.give_up_after} before giving up)..."
+        )
+        (sleeper or time.sleep)(delay)
+        return delay
+
+
+def translate_with_retry(translator, text, tries=4, base_delay=2.0, limiter=None):
     """Translate one string, retrying with exponential backoff.
 
     The free Google endpoint used by deep-translator throttles aggressively and
     raises TranslationNotFound for arbitrary inputs when it does, so a single
-    attempt is not a reliable signal of failure.
+    attempt is not a reliable signal of failure. An explicit rate-limit refusal
+    is different: it will not clear in the couple of seconds this backoff
+    covers, so it returns immediately and lets the caller pace the retry.
     """
     delay = base_delay
     for attempt in range(1, tries + 1):
         try:
             result = translator.translate(text)
             if result:
+                if limiter:
+                    limiter.record_success()
                 return result
-        except Exception:
-            pass
+        except Exception as e:
+            if is_rate_limited(e):
+                if limiter:
+                    limiter.record_limit()
+                return None
         if attempt < tries:
             time.sleep(delay)
             delay *= 2
     return None
 
 
-def translate_chunk(translator, chunk):
+def translate_chunk(translator, chunk, limiter=None):
     """Translate a list of sentences, returning a same-length list.
 
     Fast path joins the chunk with newlines in one request. If that request
@@ -369,7 +716,7 @@ def translate_chunk(translator, chunk):
     per-sentence translation so one bad sentence costs one card instead of the
     whole batch. Untranslatable sentences come back as None.
     """
-    joined = translate_with_retry(translator, "\n".join(chunk))
+    joined = translate_with_retry(translator, "\n".join(chunk), limiter=limiter)
     if joined:
         lines = joined.split("\n")
         if len(lines) == len(chunk):
@@ -378,20 +725,192 @@ def translate_chunk(translator, chunk):
             f"  Line mismatch (got {len(lines)}, expected {len(chunk)}); "
             "falling back to per-sentence translation..."
         )
+    elif limiter is not None and limiter.throttled:
+        # Throttled: the individual requests would all be refused the same way,
+        # so skip the fallback rather than make 40 more of them.
+        return [None] * len(chunk)
     else:
         print("  Batch request failed; falling back to per-sentence translation...")
 
     results = []
     for sentence in chunk:
-        results.append(translate_with_retry(translator, sentence, tries=3))
+        results.append(translate_with_retry(translator, sentence, tries=3, limiter=limiter))
+        if limiter is not None and limiter.throttled:
+            results.extend([None] * (len(chunk) - len(results)))
+            break
         time.sleep(0.3)
     return results
 
 
 
 
-def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False, detect_offset=False, translation_srt=None, source_lang="pt"):
-    base_name = os.path.splitext(input_filepath)[0]
+def match_diminutive(token, lang_config):
+    """The diminutive/augmentative label for a token, or None.
+
+    Two strategies, because the morphology differs. A Romance diminutive formed
+    by inflection ("surface", the default) only counts when the surface form
+    actually differs from the lemma. A diminutive that is its own lexeme --
+    Russian "домик", and in practice Portuguese "gatinho", neither of which
+    spacy lemmatises back to its base -- has to be matched on the lemma itself
+    ("lemma").
+    """
+    lemma_lower = token.lemma_.lower()
+    # Check the surface form too: the small models mislemmatise often enough
+    # ("farinha" -> "farinho") to slip an exception past a lemma-only lookup.
+    exceptions = lang_config.get("diminutive_exceptions", ())
+    if lemma_lower in exceptions or token.text.lower() in exceptions:
+        return None
+    if lang_config.get("diminutive_match") == "lemma":
+        candidate = lemma_lower
+    else:
+        candidate = token.text.lower()
+        if candidate == lemma_lower:
+            return None
+    for suffix, label in lang_config["diminutive_suffixes"]:
+        if candidate.endswith(suffix):
+            return label
+    return None
+
+
+def annotate_token(token, lang_config, lemma_translations=None):
+    """One vocabulary bullet: surface form, lemma, definition and grammar tags."""
+    lemma_translations = lemma_translations or {}
+    en_def = lemma_translations.get(token.lemma_, "")
+    definition = f" ({en_def})" if en_def else ""
+    lemma = token.lemma_
+    morph = token.morph.to_dict()
+    tags = []
+
+    if token.pos_ == "NOUN":
+        gender = morph.get("Gender", "")
+        article = lang_config["gender_articles"].get(gender, "")
+        if article:
+            lemma = f"{article} {lemma}"
+        else:
+            # Languages without articles (Russian) show gender as a tag instead.
+            gender_tag = lang_config.get("gender_tags", {}).get(gender)
+            if gender_tag:
+                tags.append(gender_tag)
+        if morph.get("Number") == "Plur":
+            tags.append("pl.")
+        if lang_config.get("show_case"):
+            case = CASE_LABELS.get(morph.get("Case", ""))
+            if case:
+                tags.append(case)
+
+    elif token.pos_ == "VERB":
+        conj_lemma = lemma
+        # A reflexive particle sits on the end of the lemma and would
+        # otherwise hide the conjugation class.
+        for refl in lang_config.get("reflexive_suffixes", []):
+            if conj_lemma.endswith(refl) and len(conj_lemma) > len(refl) + 2:
+                conj_lemma = conj_lemma[: -len(refl)]
+                tags.append("refl.")
+                break
+        if lang_config.get("show_aspect"):
+            aspect = ASPECT_LABELS.get(morph.get("Aspect", ""))
+            if aspect:
+                tags.append(aspect)
+        # Conjugation class from lemma ending
+        for suffix in lang_config["verb_suffixes"]:
+            if conj_lemma.endswith(suffix):
+                tags.append(f"-{suffix}")
+                break
+        # Person and number
+        person = PERSON_LABELS.get(morph.get("Person", ""), "")
+        number = morph.get("Number", "")
+        num_label = "sing." if number == "Sing" else "pl." if number == "Plur" else ""
+        if person:
+            tags.append(f"{person} {num_label}".strip())
+        elif lang_config.get("gender_tags") and morph.get("Tense") == "Past":
+            # The Russian past tense inflects for gender and number rather
+            # than person.
+            gender_tag = lang_config["gender_tags"].get(morph.get("Gender", ""), "")
+            label = " ".join(x for x in (gender_tag, num_label) if x)
+            if label:
+                tags.append(label)
+        # Tense and mood
+        tense = morph.get("Tense", "")
+        mood = morph.get("Mood", "")
+        verb_form = morph.get("VerbForm", "")
+        if verb_form == "Inf":
+            tags.append("inf.")
+        elif verb_form == "Ger":
+            tags.append("gerund")
+        elif verb_form == "Part":
+            tags.append("participle")
+        else:
+            if tense:
+                tense_map = lang_config.get("tense_map", TENSE_LABELS)
+                tags.append(tense_map.get(tense, tense.lower()))
+            if mood and mood != "Ind":
+                tags.append(MOOD_LABELS.get(mood, mood.lower()))
+
+    elif token.pos_ == "ADJ":
+        if morph.get("Number") == "Plur":
+            tags.append("pl.")
+        if lang_config.get("show_case"):
+            case = CASE_LABELS.get(morph.get("Case", ""))
+            if case:
+                tags.append(case)
+
+    diminutive = match_diminutive(token, lang_config)
+    if diminutive:
+        tags.append(diminutive)
+
+    tag_str = f", {', '.join(tags)}" if tags else ""
+    return f"• <b>{token.text}</b> -> {lemma}{definition} <i>({token.pos_.lower()}{tag_str})</i>"
+
+
+def build_vocab_html(doc, lang_config, lemma_translations=None):
+    """The <br>-joined vocabulary list for one sentence."""
+    bullets = [
+        annotate_token(token, lang_config, lemma_translations)
+        for token in doc
+        if token.pos_ in VOCAB_POS
+    ]
+    # Identical bullets collapse; order is preserved.
+    return "<br>".join(dict.fromkeys(bullets))
+
+
+def format_card(study_sentence, known_sentence, audio_filename, vocab_html, front="study"):
+    """The (front, back) pair for one card.
+
+    The study language always carries the audio, whichever side it lands on.
+    """
+    audio_tag = f"[sound:{audio_filename}]"
+    vocab_block = (
+        f"<br><br><hr><br><b>Base Vocabulary:</b><br>{vocab_html}" if vocab_html else ""
+    )
+    if front == "english":
+        # Recall direction: read the English, produce the study language.
+        return known_sentence.strip(), f"{study_sentence} {audio_tag}{vocab_block}"
+
+    front_of_card = f"{study_sentence} {audio_tag}"
+    if vocab_html and known_sentence.strip():
+        back_of_card = f"{known_sentence.strip()}{vocab_block}"
+    elif vocab_html:
+        back_of_card = f"<b>Base Vocabulary:</b><br>{vocab_html}"
+    else:
+        back_of_card = known_sentence.strip()
+    return front_of_card, back_of_card
+
+
+def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False, detect_offset=False, translation_srt=None, source_lang="pt", input_lang=None, front="study", output_name=None, limit=None, merge_frags=True, keep_front_matter=False, rate_limit_wait=60.0, rate_limit_give_up=5):
+    lang_config = LANGUAGE_CONFIGS[source_lang]
+    input_lang = input_lang or source_lang
+    # The input is already the study language unless it is English, in which
+    # case the study language has to be produced by translating it.
+    generated_study = input_lang != source_lang
+    is_book = os.path.splitext(input_filepath)[1].lower() in BOOK_EXTENSIONS
+
+    stem = os.path.splitext(os.path.basename(input_filepath))[0]
+    # Book filenames are long and full of punctuation, and would otherwise
+    # become the deck name, the audio directory and every mp3 filename.
+    base_name = os.path.join(
+        os.path.dirname(input_filepath),
+        output_name or (slugify(stem) if is_book else stem),
+    )
     safe_base_name = os.path.basename(base_name).replace(" ", "")
     output_filepath = f"{base_name}_AnkiDeck.tsv"
     audio_dir = f"{base_name}_Audio"
@@ -410,63 +929,105 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
         except (json.JSONDecodeError, OSError) as e:
             print(f"Could not read translation cache ({e}); starting fresh.")
 
-    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+    # Vocabulary definitions used to be re-requested on every batch of every
+    # run, which dominates the cost of a resumed book run.
+    lemma_cache_filepath = f"{base_name}_lemmas.json"
+    lemma_cache = {}
+    if not no_cache and os.path.exists(lemma_cache_filepath):
         try:
-            with open(input_filepath, "r", encoding=encoding) as file:
-                content = file.read()
-            print(f"Read SRT file with encoding: {encoding}")
-            break
-        except (UnicodeDecodeError, UnicodeError):
-            continue
+            with open(lemma_cache_filepath, "r", encoding="utf-8") as cf:
+                lemma_cache = json.load(cf)
+            print(f"Loaded {len(lemma_cache)} cached lemma definitions")
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Could not read lemma cache ({e}); starting fresh.")
+
+    study_code = lang_config["translator_source"]
+    # Book mode generates the study language from English; subtitle mode
+    # translates the study language into English.
+    if generated_study:
+        translator = GoogleTranslator(source=input_lang, target=study_code)
     else:
-        print("Error: Could not decode SRT file with any supported encoding.")
-        sys.exit(1)
-
-    lang_config = LANGUAGE_CONFIGS[source_lang]
-
-    blocks = content.strip().split("\n\n")
-    translator = GoogleTranslator(source=lang_config["translator_source"], target="en")
+        translator = GoogleTranslator(source=study_code, target="en")
+    # Vocabulary definitions always run study language -> English.
+    lemma_translator = GoogleTranslator(source=study_code, target="en")
 
     preloaded_translations = None
-    if translation_srt:
-        preloaded_translations = parse_srt_texts(translation_srt, strip_annotations=not keep_annotations)
-        print(f"Loaded {len(preloaded_translations)} translations from {translation_srt}")
+    source_audio = None
+    all_srt_spans = []  # every span, unfiltered - used for offset detection
+
+    if is_book:
+        blocks = parse_book(input_filepath)
+        print(f"Parsed {len(blocks)} blocks from {os.path.basename(input_filepath)}")
+        texts = filter_book_blocks(blocks, keep_front_matter)
+        if len(texts) != len(blocks):
+            print(f"  {len(texts)} left after dropping front/back matter")
+        if merge_frags:
+            before = len(texts)
+            texts = merge_fragments(texts)
+            print(f"  {len(texts)} left after merging {before - len(texts)} sentence fragments")
+        all_source_texts = texts
+        all_timestamps = []
+    else:
+        for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                with open(input_filepath, "r", encoding=encoding) as file:
+                    content = file.read()
+                print(f"Read subtitle file with encoding: {encoding}")
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        else:
+            print("Error: Could not decode subtitle file with any supported encoding.")
+            sys.exit(1)
+
+        blocks = content.strip().split("\n\n")
+
+        if translation_srt:
+            preloaded_translations = parse_srt_texts(translation_srt, strip_annotations=not keep_annotations)
+            print(f"Loaded {len(preloaded_translations)} translations from {translation_srt}")
+
+        if audio_source:
+            from pydub import AudioSegment
+            print(f"Loading source audio: {audio_source}")
+            source_audio = AudioSegment.from_file(audio_source)
+            print(f"Audio loaded: {len(source_audio) / 1000:.1f}s")
+
+        all_entries = []  # list of (text, timestamp_or_none)
+        annotation_only = 0
+        for block in blocks:
+            # Collect the raw span before any filtering: offset detection wants every
+            # timed event, including the sound effects we drop as cards.
+            for line in block.split("\n"):
+                if "-->" in line:
+                    span = parse_srt_timestamp(line)
+                    if span:
+                        all_srt_spans.append(span)
+                    break
+
+            result = parse_subtitle_block(block, strip_annotations=not keep_annotations)
+            if result:
+                all_entries.append(result)
+            elif parse_subtitle_block(block, strip_annotations=False):
+                # Had content, but it was purely bracketed annotation.
+                annotation_only += 1
+
+        if annotation_only:
+            print(f"Skipped {annotation_only} annotation-only blocks (sound effects, etc.)")
+
+        all_source_texts = [e[0] for e in all_entries]
+        all_timestamps = [e[1] for e in all_entries]
+
+    if limit is not None:
+        if limit <= 0:
+            # Parse-only: report what the filters produced and stop before
+            # spending anything on translation or audio.
+            print(f"Parse-only run (--limit {limit}); nothing translated or written.")
+            return
+        all_source_texts = all_source_texts[:limit]
+        print(f"Limited to the first {len(all_source_texts)} blocks (--limit)")
 
     print(f"Loading {source_lang} NLP model ({lang_config['spacy_model']})...")
     nlp = spacy.load(lang_config["spacy_model"])
-
-    source_audio = None
-    if audio_source:
-        from pydub import AudioSegment
-        print(f"Loading source audio: {audio_source}")
-        source_audio = AudioSegment.from_file(audio_source)
-        print(f"Audio loaded: {len(source_audio) / 1000:.1f}s")
-
-    all_entries = []  # list of (text, timestamp_or_none)
-    all_srt_spans = []  # every span, unfiltered - used for offset detection
-    annotation_only = 0
-    for block in blocks:
-        # Collect the raw span before any filtering: offset detection wants every
-        # timed event, including the sound effects we drop as cards.
-        for line in block.split("\n"):
-            if "-->" in line:
-                span = parse_srt_timestamp(line)
-                if span:
-                    all_srt_spans.append(span)
-                break
-
-        result = parse_subtitle_block(block, strip_annotations=not keep_annotations)
-        if result:
-            all_entries.append(result)
-        elif parse_subtitle_block(block, strip_annotations=False):
-            # Had content, but it was purely bracketed annotation.
-            annotation_only += 1
-
-    if annotation_only:
-        print(f"Skipped {annotation_only} annotation-only blocks (sound effects, etc.)")
-
-    all_pt_texts = [e[0] for e in all_entries]
-    all_timestamps = [e[1] for e in all_entries]
 
     if detect_offset:
         if not source_audio:
@@ -494,16 +1055,34 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                 audio_offset = detected
                 print(f"  Using detected offset: {audio_offset:+d} ms")
 
-    print(f"Starting processing of {len(all_pt_texts)} blocks with audio generation...")
+    print(f"Starting processing of {len(all_source_texts)} blocks with audio generation...")
 
     anki_cards = []
-    chunk_size = 40
+    # Prose paragraphs survive the \n-join round trip less reliably than
+    # subtitle lines, and each line-count mismatch costs a per-sentence retry.
+    chunk_size = 20 if is_book else 40
     card_counter = 0
     failed_sentences = []
+    limiter = RateLimiter(base_delay=rate_limit_wait, give_up_after=rate_limit_give_up)
+    # Vocabulary definitions are optional garnish; sentences are not. Being
+    # throttled on definitions costs nothing but the definitions, so it stops
+    # asking rather than stopping the run.
+    skip_lemmas = False
+    aborted = False
     missing_audio = []
 
-    for i in range(0, len(all_pt_texts), chunk_size):
-        chunk = all_pt_texts[i : i + chunk_size]
+    for i in range(0, len(all_source_texts), chunk_size):
+        chunk = all_source_texts[i : i + chunk_size]
+
+        if limiter.throttled and not no_translate and preloaded_translations is None:
+            if limiter.exhausted:
+                print(
+                    f"\nStopping after {limiter.consecutive} consecutive rate-limit refusals. "
+                    "Progress is cached; re-run the same command later to continue."
+                )
+                aborted = True
+                break
+            limiter.wait()
 
         try:
             if preloaded_translations is not None:
@@ -514,7 +1093,7 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                 if len(en_texts) < len(chunk):
                     print(
                         f"Translation SRT ran out after {len(preloaded_translations)} entries "
-                        f"but the source has {len(all_pt_texts)}; skipping remaining cards."
+                        f"but the source has {len(all_source_texts)}; skipping remaining cards."
                     )
                     break
             elif no_translate:
@@ -522,14 +1101,23 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
             else:
                 missing = [t for t in chunk if t not in translation_cache]
                 if missing:
-                    for src, dst in zip(missing, translate_chunk(translator, missing)):
+                    for src, dst in zip(missing, translate_chunk(translator, missing, limiter)):
                         if dst:
                             translation_cache[src] = dst
                 en_texts = [translation_cache.get(t) for t in chunk]
 
+            # The study language is what gets spacy, TTS and the vocab pass;
+            # which side of the pair it is depends on the input language.
+            if generated_study:
+                study_texts, known_texts = en_texts, chunk
+            else:
+                study_texts, known_texts = chunk, en_texts
+
             if True:
                 # NLP pass: batch-process all sentences and collect unique lemmas
-                sentence_docs = list(nlp.pipe(chunk, disable=["parser", "ner"]))
+                sentence_docs = list(nlp.pipe(
+                    [t or "" for t in study_texts], disable=["parser", "ner"]
+                ))
                 all_lemmas = list(dict.fromkeys(
                     token.lemma_
                     for doc in sentence_docs
@@ -538,31 +1126,51 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                 ))
 
                 lemma_translations = {}
-                if all_lemmas and not no_translate:
-                    time.sleep(1)
-                    translated_lemmas = translate_with_retry(translator, "\n".join(all_lemmas))
-                    if translated_lemmas:
-                        en_lemmas = translated_lemmas.split("\n")
-                        if len(en_lemmas) == len(all_lemmas):
-                            lemma_translations = dict(zip(all_lemmas, en_lemmas))
+                if all_lemmas and not no_translate and not skip_lemmas:
+                    unknown = [l for l in all_lemmas if l not in lemma_cache]
+                    if unknown:
+                        time.sleep(1)
+                        lemma_limiter = RateLimiter()
+                        translated_lemmas = translate_with_retry(
+                            lemma_translator, "\n".join(unknown), limiter=lemma_limiter
+                        )
+                        if lemma_limiter.throttled:
+                            skip_lemmas = True
+                            print(
+                                "  Rate limited on vocabulary definitions; skipping them for the "
+                                "rest of this run. Cards are unaffected apart from the glosses."
+                            )
+                        if translated_lemmas:
+                            en_lemmas = translated_lemmas.split("\n")
+                            if len(en_lemmas) == len(unknown):
+                                lemma_cache.update(zip(unknown, en_lemmas))
+                            else:
+                                print("  Lemma line mismatch; vocab definitions omitted for this batch.")
                         else:
-                            print("  Lemma line mismatch; vocab definitions omitted for this batch.")
-                    else:
-                        print("  Lemma translation failed; vocab definitions omitted for this batch.")
+                            print("  Lemma translation failed; vocab definitions omitted for this batch.")
+                    lemma_translations = {l: lemma_cache[l] for l in all_lemmas if l in lemma_cache}
 
-                for j, (pt_sentence, en_sentence, doc) in enumerate(zip(chunk, en_texts, sentence_docs)):
+                for j, (study_sentence, known_sentence, doc) in enumerate(zip(study_texts, known_texts, sentence_docs)):
                     global_index = i + j
 
                     # No translation for this sentence: report it at the end
                     # instead of discarding the surrounding batch.
-                    if en_sentence is None:
-                        failed_sentences.append(pt_sentence)
+                    if study_sentence is None or known_sentence is None:
+                        failed_sentences.append(chunk[j])
                         continue
 
                     card_counter += 1
-                    # Numbered by position in the SRT, not by card count, so a
-                    # sentence keeps the same filename across resumed runs.
-                    audio_filename = f"{safe_base_name}_{str(global_index + 1).zfill(4)}.mp3"
+                    if is_book:
+                        # Books get hashed names rather than an index: changing
+                        # the filter or fragment merging reshuffles positions,
+                        # and an index-named clip would then be silently reused
+                        # for different text. Hashing also dedupes repeats.
+                        digest = hashlib.sha1(study_sentence.encode("utf-8")).hexdigest()[:10]
+                        audio_filename = f"{safe_base_name}_{digest}.mp3"
+                    else:
+                        # Numbered by position in the SRT, not by card count, so a
+                        # sentence keeps the same filename across resumed runs.
+                        audio_filename = f"{safe_base_name}_{str(global_index + 1).zfill(4)}.mp3"
                     audio_filepath = os.path.join(audio_dir, audio_filename)
 
                     # 1. Generate Audio (skip if already exists)
@@ -575,7 +1183,7 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                                 print(f"Audio slicing failed for {audio_filename}: {e}")
                         else:
                             try:
-                                generate_audio(pt_sentence, audio_filepath, tts_provider, lang_config)
+                                generate_audio(study_sentence, audio_filepath, tts_provider, lang_config)
                             except Exception as e:
                                 print(f"Audio generation failed for {audio_filename}: {e}")
 
@@ -585,129 +1193,20 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                         missing_audio.append(audio_filename)
 
                     # 2. Extract Base Vocabulary with English definitions
-                    vocab_list = []
-                    for token in doc:
-                        if token.pos_ in VOCAB_POS:
-                            en_def = lemma_translations.get(token.lemma_, "")
-                            definition = f" ({en_def})" if en_def else ""
-                            lemma = token.lemma_
-                            morph = token.morph.to_dict()
-                            tags = []
-
-                            if token.pos_ == "NOUN":
-                                gender = morph.get("Gender", "")
-                                article = lang_config["gender_articles"].get(gender, "")
-                                if article:
-                                    lemma = f"{article} {lemma}"
-                                else:
-                                    # Languages without articles (Russian) show
-                                    # gender as a tag instead.
-                                    gender_tag = lang_config.get("gender_tags", {}).get(gender)
-                                    if gender_tag:
-                                        tags.append(gender_tag)
-                                if morph.get("Number") == "Plur":
-                                    tags.append("pl.")
-                                if lang_config.get("show_case"):
-                                    case = CASE_LABELS.get(morph.get("Case", ""))
-                                    if case:
-                                        tags.append(case)
-
-                            elif token.pos_ == "VERB":
-                                conj_lemma = lemma
-                                # A reflexive particle sits on the end of the
-                                # lemma and would hide the conjugation class.
-                                for refl in lang_config.get("reflexive_suffixes", []):
-                                    if conj_lemma.endswith(refl) and len(conj_lemma) > len(refl) + 2:
-                                        conj_lemma = conj_lemma[: -len(refl)]
-                                        tags.append("refl.")
-                                        break
-                                if lang_config.get("show_aspect"):
-                                    aspect = ASPECT_LABELS.get(morph.get("Aspect", ""))
-                                    if aspect:
-                                        tags.append(aspect)
-                                # Conjugation class from lemma ending
-                                for suffix in lang_config["verb_suffixes"]:
-                                    if conj_lemma.endswith(suffix):
-                                        tags.append(f"-{suffix}")
-                                        break
-                                # Person and number
-                                person = PERSON_LABELS.get(morph.get("Person", ""), "")
-                                number = morph.get("Number", "")
-                                num_label = "sing." if number == "Sing" else "pl." if number == "Plur" else ""
-                                if person:
-                                    tags.append(f"{person} {num_label}".strip())
-                                elif lang_config.get("gender_tags") and morph.get("Tense") == "Past":
-                                    # The Russian past tense inflects for gender
-                                    # and number rather than person.
-                                    gender_tag = lang_config["gender_tags"].get(morph.get("Gender", ""), "")
-                                    label = " ".join(x for x in (gender_tag, num_label) if x)
-                                    if label:
-                                        tags.append(label)
-                                # Tense and mood
-                                tense = morph.get("Tense", "")
-                                mood = morph.get("Mood", "")
-                                verb_form = morph.get("VerbForm", "")
-                                if verb_form == "Inf":
-                                    tags.append("inf.")
-                                elif verb_form == "Ger":
-                                    tags.append("gerund")
-                                elif verb_form == "Part":
-                                    tags.append("participle")
-                                else:
-                                    if tense:
-                                        tense_map = lang_config.get("tense_map", TENSE_LABELS)
-                                        tags.append(tense_map.get(tense, tense.lower()))
-                                    if mood and mood != "Ind":
-                                        tags.append(MOOD_LABELS.get(mood, mood.lower()))
-
-                            elif token.pos_ == "ADJ":
-                                if morph.get("Number") == "Plur":
-                                    tags.append("pl.")
-                                if lang_config.get("show_case"):
-                                    case = CASE_LABELS.get(morph.get("Case", ""))
-                                    if case:
-                                        tags.append(case)
-
-                            # Diminutive/augmentative detection. A Romance
-                            # diminutive is an inflection of the base word, so
-                            # only an altered surface form counts. A Russian one
-                            # is its own lexeme ("домик"), whose nominative is
-                            # identical to its lemma, so match the lemma there.
-                            if lang_config.get("diminutive_match") == "lemma":
-                                candidate = token.lemma_.lower()
-                            else:
-                                candidate = token.text.lower()
-                                if candidate == lemma.lower():
-                                    candidate = ""
-                            if candidate:
-                                for suffix, label in lang_config["diminutive_suffixes"]:
-                                    if candidate.endswith(suffix):
-                                        tags.append(label)
-                                        break
-
-                            tag_str = f", {', '.join(tags)}" if tags else ""
-                            vocab_list.append(
-                                f"• <b>{token.text}</b> -> {lemma}{definition} <i>({token.pos_.lower()}{tag_str})</i>"
-                            )
-                    vocab_html = "<br>".join(dict.fromkeys(vocab_list))
+                    vocab_html = build_vocab_html(doc, lang_config, lemma_translations)
 
                     # 3. Format Card Sides
-                    front_of_card = f"{pt_sentence} [sound:{audio_filename}]"
-                    if vocab_html and en_sentence.strip():
-                        back_of_card = f"{en_sentence.strip()}<br><br><hr><br><b>Base Vocabulary:</b><br>{vocab_html}"
-                    elif vocab_html:
-                        back_of_card = f"<b>Base Vocabulary:</b><br>{vocab_html}"
-                    else:
-                        back_of_card = en_sentence.strip()
-
+                    front_of_card, back_of_card = format_card(
+                        study_sentence, known_sentence, audio_filename, vocab_html, front
+                    )
                     anki_cards.append([front_of_card, back_of_card])
 
         except Exception as e:
             batch_start = i + 1
-            batch_end = min(i + chunk_size, len(all_pt_texts))
+            batch_end = min(i + chunk_size, len(all_source_texts))
             print(f"Error processing cards {batch_start}-{batch_end}: {type(e).__name__}: {e}")
 
-        print(f"Processed {min(i + chunk_size, len(all_pt_texts))}/{len(all_pt_texts)} cards...")
+        print(f"Processed {min(i + chunk_size, len(all_source_texts))}/{len(all_source_texts)} cards...")
 
         # Persist after every batch so an interrupted run keeps its progress.
         if not no_cache and not no_translate and translation_cache:
@@ -716,9 +1215,34 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                     json.dump(translation_cache, cf, ensure_ascii=False, indent=1)
             except OSError as e:
                 print(f"Could not write translation cache: {e}")
+        if not no_cache and not no_translate and lemma_cache:
+            try:
+                with open(lemma_cache_filepath, "w", encoding="utf-8") as cf:
+                    json.dump(lemma_cache, cf, ensure_ascii=False, indent=1)
+            except OSError as e:
+                print(f"Could not write lemma cache: {e}")
 
         if not no_translate:
             time.sleep(1)
+
+    # A run cut short by throttling holds only part of the deck. Overwriting a
+    # larger existing deck with it would destroy finished work for no gain --
+    # the caches already carry the progress into the next run.
+    # "aborted" only covers breaking out of the loop; a run whose final batch was
+    # refused ends throttled without ever reaching that check.
+    if (aborted or limiter.throttled) and os.path.exists(output_filepath):
+        try:
+            with open(output_filepath, encoding="utf-8", newline="") as file:
+                existing = sum(1 for _ in csv.reader(file, delimiter="\t"))
+        except OSError:
+            existing = 0
+        if existing > len(anki_cards):
+            print(
+                f"\nKept the existing {existing}-card deck at {output_filepath} rather than "
+                f"replacing it with this run's partial {len(anki_cards)}."
+            )
+            print("Caches are saved; re-run the same command to continue where this left off.")
+            return
 
     with open(output_filepath, "w", encoding="utf-8", newline="") as file:
         csv.writer(file, delimiter="\t").writerows(anki_cards)
@@ -759,13 +1283,63 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert an SRT subtitle file into an Anki flashcard deck.")
-    parser.add_argument("srt_file")
+    parser = argparse.ArgumentParser(description="Convert a subtitle file or ebook into an Anki flashcard deck.")
+    parser.add_argument("input_file", help="Subtitle file (.srt, .vtt) or ebook (.epub, .mobi).")
     parser.add_argument(
         "--source-lang",
         choices=list(LANGUAGE_CONFIGS.keys()),
         default="pt",
-        help="Source language of the subtitle file (default: pt). Supported: " + ", ".join(LANGUAGE_CONFIGS.keys()),
+        help="Language you are studying (default: pt). Supported: " + ", ".join(LANGUAGE_CONFIGS.keys()),
+    )
+    parser.add_argument(
+        "--input-lang",
+        default=None,
+        help=(
+            "Language of the input file, when it differs from --source-lang. "
+            "Use 'en' for an English ebook: the study language is then produced "
+            "by translating it, and gets the audio and vocabulary annotations."
+        ),
+    )
+    parser.add_argument(
+        "--front",
+        choices=["study", "english"],
+        default="study",
+        help=(
+            "Which side goes on the front of the card (default: study). "
+            "'study' puts the study language + audio on the front; 'english' "
+            "puts English on the front and the study language + audio on the back."
+        ),
+    )
+    parser.add_argument(
+        "--output-name",
+        default=None,
+        help=(
+            "Base name for the deck, audio directory and caches. Defaults to the "
+            "input filename, slugified for ebooks (whose filenames are long)."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Only process the first N blocks. Use this to test a book cheaply "
+            "before a full run. --limit 0 parses and reports, then stops."
+        ),
+    )
+    parser.add_argument(
+        "--no-merge-fragments",
+        action="store_true",
+        help=(
+            "Ebooks only. Keep every block as its own card instead of joining "
+            "mid-sentence fragments (lines ending in a dash or comma) with the "
+            "block that follows them."
+        ),
+    )
+    parser.add_argument(
+        "--keep-front-matter",
+        action="store_true",
+        help="Ebooks only. Keep the table of contents, copyright page and similar matter.",
     )
     parser.add_argument(
         "--translation-srt",
@@ -812,6 +1386,25 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--rate-limit-wait",
+        type=float,
+        default=60.0,
+        help=(
+            "Seconds to wait after the first rate-limit refusal, doubling each time "
+            "up to 10 minutes (default: 60). The free Google endpoint sends no "
+            "Retry-After header, so this is a guess rather than a published delay."
+        ),
+    )
+    parser.add_argument(
+        "--rate-limit-give-up",
+        type=int,
+        default=5,
+        help=(
+            "Stop after this many consecutive rate-limit refusals and let the caches "
+            "carry progress to a later run (default: 5)."
+        ),
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="Ignore and do not write the *_translations.json cache.",
@@ -839,8 +1432,29 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if not os.path.exists(args.srt_file):
-        print("Error: SRT file not found.")
+    if not os.path.exists(args.input_file):
+        print("Error: Input file not found.")
+        sys.exit(1)
+
+    is_book = os.path.splitext(args.input_file)[1].lower() in BOOK_EXTENSIONS
+    generated_study = args.input_lang and args.input_lang != args.source_lang
+
+    if generated_study and args.no_translate:
+        # The study language IS the translation here, so skipping it leaves no
+        # text to speak, annotate or put on a card.
+        print("Error: --no-translate cannot be combined with --input-lang; the study language is the translation.")
+        sys.exit(1)
+
+    if is_book and args.audio:
+        print("Error: --audio slices clips using subtitle timestamps and does not apply to ebooks.")
+        sys.exit(1)
+
+    if is_book and args.translation_srt:
+        print("Error: --translation-srt pairs subtitle files and does not apply to ebooks.")
+        sys.exit(1)
+
+    if is_book and args.detect_offset:
+        print("Error: --detect-offset aligns audio against subtitle timings and does not apply to ebooks.")
         sys.exit(1)
 
     if args.audio and not os.path.exists(args.audio):
@@ -852,7 +1466,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     create_anki_deck(
-        args.srt_file,
+        args.input_file,
         args.tts,
         audio_source=args.audio,
         audio_padding=args.audio_padding,
@@ -863,4 +1477,12 @@ if __name__ == "__main__":
         detect_offset=args.detect_offset,
         translation_srt=args.translation_srt,
         source_lang=args.source_lang,
+        input_lang=args.input_lang,
+        front=args.front,
+        output_name=args.output_name,
+        limit=args.limit,
+        merge_frags=not args.no_merge_fragments,
+        keep_front_matter=args.keep_front_matter,
+        rate_limit_wait=args.rate_limit_wait,
+        rate_limit_give_up=args.rate_limit_give_up,
     )
