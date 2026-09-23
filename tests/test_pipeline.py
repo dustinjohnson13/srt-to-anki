@@ -2,6 +2,7 @@
 import csv
 import json
 import os
+import re
 import shutil
 
 import pytest
@@ -70,16 +71,26 @@ class TestBookRun:
         assert back.startswith("<pt>People look for the shortcut.")
         assert "[sound:" in back and "[sound:" not in front
 
-    def test_audio_is_hashed_and_deduplicated(self, book):
-        """The fixture repeats a line; both cards should share one clip."""
+    def test_audio_is_hashed_not_numbered(self, book):
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
+                             output_name="deck", no_cache=True)
+        clips = os.listdir(os.path.join(os.path.dirname(book), "deck_Audio"))
+        assert clips
+        # Hashed from the text, never numbered by position: re-segmenting the
+        # book must not point an existing clip at different words.
+        assert not any(re.fullmatch(r"deck_\d{4}\.mp3", c) for c in clips)
+        assert all(re.fullmatch(r"deck_[0-9a-f]{10}\.mp3", c) for c in clips)
+
+    def test_a_repeated_line_yields_one_card_and_one_clip(self, book):
+        """The fixture repeats a paragraph verbatim."""
         run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True)
         base = os.path.dirname(book)
         rows = read_tsv(os.path.join(base, "deck_AnkiDeck.tsv"))
         clips = os.listdir(os.path.join(base, "deck_Audio"))
-        assert len(rows) == 5
+        assert len(rows) == 4, "the repeated paragraph should appear once"
         assert len(clips) == 4
-        assert rows[3][1] == rows[4][1]
+        assert len({r[1] for r in rows}) == 4
 
     def test_output_name_defaults_to_a_slug(self, make_epub):
         book = make_epub([("chapter1.xhtml", "<p>Hello there.</p>")],
@@ -321,3 +332,99 @@ class TestThrottledRetry:
                              output_name="deck", no_cache=True,
                              rate_limit_wait=1, rate_limit_give_up=2)
         assert not os.path.exists(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
+
+
+class TestDuplicateCards:
+    def test_blocks_that_translate_alike_yield_one_card(self, make_epub, monkeypatch):
+        """"WHY" and "Why?" both become "Por que?" -- two identical backs."""
+        book = make_epub([("chapter1.xhtml",
+                           "<p>WHY</p><p>Why?</p><p>Because.</p>")])
+
+        class Stub:
+            def __init__(self, source, target):
+                self.source, self.target = source, target
+
+            def translate(self, text):
+                out = []
+                for line in text.split("\n"):
+                    out.append("Por que o gato dorme?" if line.lower().strip(" ?")
+                               == "why" else f"<pt>{line}")
+                return "\n".join(out)
+
+        monkeypatch.setattr(run, "GoogleTranslator", Stub)
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en",
+                             front="english", output_name="deck", no_cache=True)
+        rows = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
+        backs = [r[1] for r in rows]
+        assert len(backs) == len(set(backs)), "no two cards should share a back"
+        assert len(rows) == 2
+
+    def test_subtitle_decks_keep_repeated_lines(self, tmp_path, monkeypatch):
+        """Only books dedupe; changing subtitle output would be a regression."""
+        srt = tmp_path / "ep.srt"
+        srt.write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\nO gato dorme.\n\n"
+            "2\n00:00:03,000 --> 00:00:04,000\nO gato dorme.\n",
+            encoding="utf-8",
+        )
+        run.create_anki_deck(str(srt), "gtts", translator_name="google", no_cache=True)
+        rows = read_tsv(str(srt).replace(".srt", "_AnkiDeck.tsv"))
+        assert len(rows) == 2
+
+
+class TestColonHandlingInThePipeline:
+    def test_the_english_front_keeps_its_original_capitalisation(self, make_epub, monkeypatch):
+        """Only the text sent to the translator is adjusted."""
+        book = make_epub([("chapter1.xhtml", "<p>Discipline: The root of it.</p>")])
+        seen = []
+
+        class Stub:
+            def __init__(self, source, target):
+                self.source, self.target = source, target
+
+            def translate(self, text):
+                seen.append(text)
+                return "\n".join(f"O gato dorme. {l}" for l in text.split("\n"))
+
+        monkeypatch.setattr(run, "GoogleTranslator", Stub)
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en",
+                             front="english", output_name="deck", no_cache=True)
+        rows = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
+        assert rows[0][0] == "Discipline: The root of it."      # card unchanged
+        assert any("Discipline: the root of it." in s for s in seen)  # request adjusted
+
+    def test_the_cache_is_keyed_on_the_original_text(self, make_epub, monkeypatch):
+        book = make_epub([("chapter1.xhtml", "<p>Discipline: The root of it.</p>")])
+
+        class Stub:
+            def __init__(self, source, target):
+                self.source, self.target = source, target
+
+            def translate(self, text):
+                return "\n".join(f"O gato dorme. {l}" for l in text.split("\n"))
+
+        monkeypatch.setattr(run, "GoogleTranslator", Stub)
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en",
+                             front="english", output_name="deck")
+        cache = json.load(open(os.path.join(os.path.dirname(book), "deck_translations.json"),
+                               encoding="utf-8"))
+        assert "Discipline: The root of it." in cache
+
+    def test_subtitle_runs_are_not_adjusted(self, tmp_path, monkeypatch):
+        """Lower-casing a capital in the source language risks flattening names."""
+        srt = tmp_path / "ep.srt"
+        srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nEle disse: Sonic e rapido.\n",
+                       encoding="utf-8")
+        seen = []
+
+        class Stub:
+            def __init__(self, source, target):
+                self.source, self.target = source, target
+
+            def translate(self, text):
+                seen.append(text)
+                return "\n".join(f"<en>{l}" for l in text.split("\n"))
+
+        monkeypatch.setattr(run, "GoogleTranslator", Stub)
+        run.create_anki_deck(str(srt), "gtts", translator_name="google", no_cache=True)
+        assert any("Sonic" in s for s in seen), "the name must reach the translator intact"

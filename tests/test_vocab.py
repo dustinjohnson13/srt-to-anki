@@ -110,3 +110,71 @@ class TestBuildVocabHtml:
 
     def test_sentence_without_content_words_yields_nothing(self, pt_nlp):
         assert run.build_vocab_html(pt_nlp("O e a."), PT) == ""
+
+
+class TestHeadingCase:
+    """Books set headings in title or full caps, which spacy reads as proper
+    nouns -- dropping every word from the vocabulary list."""
+
+    @pytest.mark.parametrize("text,expected", [
+        ("O Caminho da Disciplina.", "o caminho da disciplina."),
+        ("DISCIPLINA DEVE HAVER.", "disciplina deve haver."),
+        ("A RAIZ", "a raiz"),
+    ])
+    def test_headings_are_lowercased(self, text, expected):
+        assert run.normalize_case_for_nlp(text) == expected
+
+    @pytest.mark.parametrize("text", [
+        "E se você veio aqui procurando por isso:",
+        "O atalho é uma mentira.",
+        "Mais forte. Mais inteligente.",
+    ])
+    def test_ordinary_sentences_are_untouched(self, text):
+        assert run.normalize_case_for_nlp(text) == text
+
+    def test_a_real_proper_noun_sentence_survives(self):
+        """One capitalised name in a normal sentence is not a heading."""
+        text = "O Sonic correu muito rápido hoje."
+        assert run.normalize_case_for_nlp(text) == text
+
+    @pytest.mark.parametrize("text", ["", "   ", "123 456"])
+    def test_textless_input_is_returned_unchanged(self, text):
+        assert run.normalize_case_for_nlp(text) == text
+
+    def test_a_title_cased_heading_yields_vocabulary(self, pt_nlp):
+        raw = pt_nlp("O Caminho da Disciplina.")
+        assert run.build_vocab_html(raw, PT) == "", "precondition: PROPN hides these"
+        fixed = pt_nlp(run.normalize_case_for_nlp("O Caminho da Disciplina."))
+        html = run.build_vocab_html(fixed, PT)
+        assert "caminho" in html and "disciplina" in html
+
+
+class TestGlossCleanup:
+    """Translators treat a lone word as a sentence and capitalise/full-stop it."""
+
+    @pytest.mark.parametrize("gloss,lemma,expected", [
+        ("Here.", "aqui", "here"),
+        ("Good.", "bom", "good"),
+        ("Better", "melhor", "better"),
+        ("Overcoming", "superar", "overcoming"),
+        ("cat", "gato", "cat"),
+    ])
+    def test_sentence_casing_is_stripped(self, gloss, lemma, expected):
+        assert run.clean_gloss(gloss, lemma) == expected
+
+    @pytest.mark.parametrize("gloss,lemma", [("I need it.", "preciso"), ("I will.", "farei")])
+    def test_the_english_pronoun_keeps_its_capital(self, gloss, lemma):
+        assert run.clean_gloss(gloss, lemma).startswith("I")
+
+    def test_a_capitalised_source_word_keeps_its_capital(self):
+        assert run.clean_gloss("Brazil", "Brasil") == "Brazil"
+        assert run.clean_gloss("DISCIPLINE", "DISCIPLINA") == "DISCIPLINE"
+
+    @pytest.mark.parametrize("gloss", ["", None, "   ", "."])
+    def test_empty_glosses_stay_empty(self, gloss):
+        assert run.clean_gloss(gloss, "x") == ""
+
+    def test_the_cache_keeps_the_raw_value(self, pt_nlp):
+        """Cleanup happens at render time, so a better cleanup later needs no refetch."""
+        html = run.build_vocab_html(pt_nlp("Estou aqui."), PT, {"aqui": "Here."})
+        assert "(here)" in html

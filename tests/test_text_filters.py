@@ -111,3 +111,41 @@ class TestSlugify:
     @pytest.mark.parametrize("raw", ["", "---", "!!!"])
     def test_falls_back_when_nothing_survives(self, raw):
         assert run.slugify(raw) == "deck"
+
+
+class TestColonPreparation:
+    """Models drop the clause before a colon when the next word is capitalised.
+
+    "Discipline: The root of all good qualities" comes back as "A raiz de todas
+    as boas qualidades" -- "Discipline" gone -- while the same sentence with a
+    lower-case "the" keeps it. ~13% of this book's blocks match the pattern.
+    """
+
+    def test_a_title_cased_word_after_a_colon_is_lowered(self):
+        assert run.prepare_for_translation("Discipline: The root of it.") == \
+            "Discipline: the root of it."
+
+    def test_all_caps_words_are_left_alone(self):
+        """Lower-casing only the first letter would give "gOOD"."""
+        assert run.prepare_for_translation("Remember: GOOD.") == "Remember: GOOD."
+        assert run.prepare_for_translation("GOOD: DO the work.") == "GOOD: DO the work."
+
+    def test_a_lone_english_I_is_left_alone(self):
+        assert run.prepare_for_translation("He said: I will.") == "He said: I will."
+
+    @pytest.mark.parametrize("text", [
+        "And if you came here looking for that:",   # colon at the end
+        "It is 3: 4 odds.",                          # digits, not a word
+        "no colons here at all",
+        "",
+    ])
+    def test_everything_else_is_untouched(self, text):
+        assert run.prepare_for_translation(text) == text
+
+    def test_only_the_first_letter_of_the_word_changes(self):
+        assert run.prepare_for_translation("Rule: McDonald was right.") == \
+            "Rule: mcDonald was right."
+
+    def test_several_colons_are_all_handled(self):
+        assert run.prepare_for_translation("One: Two things. Three: Four things.") == \
+            "One: two things. Three: four things."

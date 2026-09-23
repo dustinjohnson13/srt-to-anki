@@ -1058,6 +1058,70 @@ def translate_chunk(translator, chunk, limiter=None):
 
 
 
+COLON_CAPITAL_RE = re.compile(r"(:\s+)([A-Z])(?=[a-z])")
+
+
+def prepare_for_translation(text):
+    """Lower-case the word following a mid-sentence colon.
+
+    Translation models frequently drop the clause *before* a colon when the
+    word after it is capitalised: "Discipline: The root of all good qualities"
+    comes back as "A raiz de todas as boas qualidades", losing "Discipline"
+    altogether, while the same sentence with a lower-case "the" keeps it. This
+    affects about an eighth of the blocks in a typical book.
+
+    Only the text sent to the translator changes -- the card's own English side
+    keeps its original capitalisation, and the cache stays keyed on the
+    original. No adjustment back is needed: Portuguese sets a lower-case word
+    after a colon anyway, so the output is more correct rather than less.
+
+    Only Title-Cased words are touched. This book sets whole words in capitals
+    for emphasis, and lower-casing just the first letter would give "gOOD"; a
+    lone "I" is left alone for the same reason. A proper noun directly after a
+    colon ("Murphy" here) is still lower-cased, which is cosmetic beside losing
+    a whole clause.
+    """
+    return COLON_CAPITAL_RE.sub(lambda m: m.group(1) + m.group(2).lower(), text)
+
+
+def normalize_case_for_nlp(text):
+    """Lower-case a heading before tagging it.
+
+    Books set headings in title or full caps, and spacy reads that casing as
+    proper nouns: "O Caminho da Disciplina" tags as PROPN PROPN, so both words
+    drop out of the vocabulary list entirely. The casing carries no
+    grammatical meaning, so it is removed before tagging.
+    """
+    words = re.findall(r"[^\W\d_]{2,}", text)
+    if not words:
+        return text
+    capitalised = sum(1 for w in words if w[0].isupper())
+    if text.isupper() or capitalised / len(words) > 0.6:
+        return text.lower()
+    return text
+
+
+def clean_gloss(gloss, lemma):
+    """Tidy a one-word definition.
+
+    Translators treat a lone word as a whole sentence and hand back "Here."
+    or "Good." -- capitalised and full-stopped. The capital is kept only when
+    the source word carries one itself, or when it is the English "I".
+    """
+    text = str(gloss or "").strip().rstrip(".").strip()
+    if not text:
+        return ""
+    keeps_capital = (
+        lemma[:1].isupper()
+        or text.isupper()
+        or text == "I"
+        or text.startswith(("I ", "I'"))
+    )
+    if not keeps_capital and text[:1].isupper():
+        text = text[0].lower() + text[1:]
+    return text
+
+
 def match_diminutive(token, lang_config):
     """The diminutive/augmentative label for a token, or None.
 
@@ -1089,7 +1153,7 @@ def match_diminutive(token, lang_config):
 def annotate_token(token, lang_config, lemma_translations=None):
     """One vocabulary bullet: surface form, lemma, definition and grammar tags."""
     lemma_translations = lemma_translations or {}
-    en_def = lemma_translations.get(token.lemma_, "")
+    en_def = clean_gloss(lemma_translations.get(token.lemma_, ""), token.lemma_)
     definition = f" ({en_def})" if en_def else ""
     lemma = token.lemma_
     morph = token.morph.to_dict()
@@ -1392,6 +1456,10 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
     # asking rather than stopping the run.
     skip_lemmas = False
     aborted = False
+    # Books repeat lines, and distinct source blocks can land on the same
+    # translation ("WHY" and "Why?" both become "Por que?"), which would give
+    # two cards with identical backs and the same audio.
+    seen_study = set()
     missing_audio = []
 
     for i in range(0, len(all_source_texts), chunk_size):
@@ -1414,7 +1482,15 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
             else:
                 missing = [t for t in chunk if t not in translation_cache]
                 while missing:
-                    for src, dst in zip(missing, translate_chunk(translator, missing, limiter)):
+                    # Only when generating the study language from English: that
+                    # is where the benefit was measured, and lower-casing a
+                    # capital in the source language risks flattening names.
+                    prepared = (
+                        [prepare_for_translation(m) for m in missing]
+                        if generated_study else missing
+                    )
+                    # Cache keys stay the original text, not the prepared form.
+                    for src, dst in zip(missing, translate_chunk(translator, prepared, limiter)):
                         if dst:
                             translation_cache[src] = dst
                     missing = [t for t in missing if t not in translation_cache]
@@ -1442,7 +1518,8 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
             if True:
                 # NLP pass: batch-process all sentences and collect unique lemmas
                 sentence_docs = list(nlp.pipe(
-                    [t or "" for t in study_texts], disable=["parser", "ner"]
+                    [normalize_case_for_nlp(t or "") for t in study_texts],
+                    disable=["parser", "ner"],
                 ))
                 all_lemmas = list(dict.fromkeys(
                     token.lemma_
@@ -1487,6 +1564,11 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
                     if study_sentence is None or known_sentence is None:
                         failed_sentences.append(chunk[j])
                         continue
+
+                    if is_book:
+                        if study_sentence in seen_study:
+                            continue
+                        seen_study.add(study_sentence)
 
                     card_counter += 1
                     if is_book:
