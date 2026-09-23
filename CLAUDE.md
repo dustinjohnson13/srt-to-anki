@@ -73,6 +73,9 @@ README.md             # User-facing docs
 - **Offset detection:** `--detect-offset` builds a voice-activity signal from the audio (frame energy above a rolling median, which suppresses music beds), builds a second from the subtitle spans, and FFT cross-correlates them. Gated on peak z-score >= 5 **and** <= 1000ms disagreement between the two halves of the file; a low-confidence result falls back to `--audio-offset`. Uses every span including annotation-only ones, since more spans mean more signal
 - **Translation sources,** in priority order: `--translation-srt` (a second subtitle file — both files are parsed with the same annotation policy so they drop the same blocks, but pairing is positional, so a file annotating different events will misalign), then `--no-translate` (empty backs), then the API
 - **Translation resilience:** `translate_with_retry()` retries with exponential backoff; `translate_chunk()` falls back to per-sentence requests on failure or line mismatch, so one bad sentence costs one card rather than 40
+- **Translation backends:** each service is a `TranslationBackend` subclass declaring how to address it (`config_key` naming its `LANGUAGE_CONFIGS` code, `english` for how it spells English) and how politely to use it (`min_interval`, `char_budget`, `max_query_chars`, `honours_delay`). `TRANSLATION_BACKENDS` is the registry and `AUTO_TRANSLATOR_ORDER` the `auto` chain, so adding a service (DeepL, Azure) is a class plus a registry entry, never another branch in `build_translator()`. `FallbackTranslator` moves to the next service permanently once one refuses; `ThrottledTranslator` enforces spacing, counts characters against the free allowance, and splits oversized requests on line boundaries
+- **Offline translation:** `ArgosBackend` runs a local model — no network, no quota, nothing to throttle — and is first in `auto`. **Portuguese uses Argos's `pb` (Brazilian) model, not `pt` (European)**; they are separate models and `pt` produces *"Estás a ficar mais forte"* against `pb`'s *"Você está ficando mais forte"*, which would clash with the Brazilian TTS voices. Hence `argos_code` rather than reusing `translator_source`. `auto` uses the model only when already installed; naming `argos` explicitly downloads it (~80MB per direction)
+- **MyMemory quirks:** it reports an exhausted quota **as the translated text** (`MYMEMORY WARNING: ...`), which `looks_like_quota_message()` catches so it is never cached as a definition, and it rejects any query over 500 characters, so `max_query_chars` splits batches on line boundaries to keep the response line count equal to the request's
 - **Rate limiting:** the free Google endpoint answers a throttled request with a bare 429 — **no `Retry-After`, no `RateLimit-*` headers** (verified against the live endpoint), and deep-translator discards the response anyway, raising a `TooManyRequests` that carries only a static string. There is therefore no server-supplied delay to honour. `is_rate_limited()` classifies the refusal by exception type and message, and a rate-limited call returns immediately instead of burning its retries — retrying into an hour-long IP block wastes time and appears to prolong it. `RateLimiter` then waits and **retries the same batch**: escalating delay from `--rate-limit-wait` (default 60s), doubling, capped at 10 minutes, jittered ±20% so repeated runs don't retry in lockstep, giving up after `--rate-limit-give-up` consecutive refusals. Retrying the same batch rather than pausing before the next one matters — a run with a single batch (any small `--limit`) has no next batch, so a between-batches wait never executes at all. Sentences and definitions hold separate counters, both built once per run from the CLI flags, so a refusal on definitions cannot push the sentence path toward aborting. Sentences and definitions are treated differently on purpose: losing a **sentence** loses a card, so that aborts the run, while losing a **definition** only loses a gloss, so `skip_lemmas` stops asking for the rest of the run and the cards are still written. That distinction is what took a throttled 597-card rebuild from ~4 minutes of futile retrying to 17 seconds
 - **Empty/partial deck guards:** a throttled run that produced no cards writes nothing at all, and a run that ends throttled will not overwrite an existing larger deck — it reports the card counts and leaves the finished file alone, since the caches already carry the progress into the next run. The check is `aborted or limiter.throttled`, because a run whose *final* batch is refused never reaches the loop's abort check
 - **Translation cache:** successful translations are written to `<name>_translations.json` after every batch and reused later, so a throttled run resumes. Lemma definitions have their own `<name>_lemmas.json` — they were previously re-requested on every batch of every run, which dominated the cost of a resumed book run. `--no-cache` disables both
@@ -100,6 +103,13 @@ README.md             # User-facing docs
 | `build_vocab_html(doc, lang_config, lemma_translations)` | The `<br>`-joined vocabulary list for one sentence |
 | `format_card(study, known, audio_filename, vocab_html, front)` | The `(front, back)` pair for one card, in either direction |
 | `is_rate_limited(exc)` | Whether an exception is the endpoint refusing us for rate reasons |
+| `looks_like_quota_message(text)` | Whether a "translation" is really a service telling us to stop |
+| `TranslationBackend` | Base strategy: how to address one service and how politely to use it |
+| `ArgosBackend` / `GoogleBackend` / `MyMemoryBackend` | The registered services |
+| `ArgosTranslator` | Local offline model, downloading on demand |
+| `ThrottledTranslator` | Spacing, character budget, and oversized-query splitting |
+| `FallbackTranslator` | Tries services in order, switching permanently on refusal |
+| `build_translator(spec, source, target, lang_config, delay)` | Composes the chain for `auto` or a named service |
 | `RateLimiter` | Escalating, jittered, capped backoff plus a give-up counter |
 | `slice_audio(source_audio, start_ms, end_ms, output_path, padding_ms, offset_ms)` | Cuts one clip from loaded audio |
 | `generate_audio(text, filepath, provider, lang_config)` | TTS synthesis across the five providers |
@@ -117,6 +127,7 @@ README.md             # User-facing docs
 | `pydub` | Audio slicing (requires ffmpeg) |
 | `gTTS` | Default TTS |
 | `google-cloud-texttospeech`, `azure-cognitiveservices-speech`, `boto3`, `elevenlabs` | Optional TTS providers |
+| `argostranslate` | Offline translation models (`ctranslate2`, `sentencepiece`, `stanza`); models download at runtime to `~/.local/share/argos-translate` |
 | `pytest` | Test suite only, via `requirements-dev.txt` |
 
 `numpy` arrives via spacy and is imported lazily inside `detect_audio_offset()`.
@@ -141,6 +152,7 @@ pytest tests/test_vocab.py  # one file
 | `test_translation.py` | Retry/backoff and the per-sentence fallback |
 | `test_pipeline.py` | `create_anki_deck` end to end: deck shape, audio naming, caches, `--limit`, throttling behaviour |
 | `test_rate_limiting.py` | 429 classification, backoff/jitter/cap, circuit breaker, no-retry-into-a-block |
+| `test_translators.py` | Backend strategy and registry, per-service language codes, throttling, query splitting, quota-message detection, failover |
 
 `tests/conftest.py` builds synthetic EPUB and MOBI files rather than committing binaries. The
 EPUB fixture deliberately writes its documents to the zip in reverse spine order, so a
@@ -152,7 +164,7 @@ Beyond the suite: run against a real `.srt` or ebook and import the `.tsv` into 
 
 ## Known Limitations
 
-- Google's free translation endpoint throttles aggressively and gives no hint when the block will lift; large decks usually need several runs, with the caches carrying progress forward
+- Google's free translation endpoints currently refuse programmatic requests with 429 regardless of IP or user agent (verified across two networks); `--translator argos` sidesteps this entirely and is the default when its models are installed
 - `--translation-srt` pairing is positional, so mismatched annotation blocks between the two files shift the alignment
 - MOBI front matter is only partly filtered (no section names to go on); EPUB is clean
 - Book cards inherit whatever the machine translation produces — fine for comprehension, but the generated side is not idiomatic native phrasing

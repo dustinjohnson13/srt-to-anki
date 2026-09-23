@@ -56,13 +56,13 @@ class TestBookRun:
         return make_epub([("chapter1.xhtml", BOOK_HTML)])
 
     def test_writes_a_two_column_deck(self, book):
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True)
         rows = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
         assert rows and all(len(r) == 2 for r in rows)
 
     def test_english_on_the_front_generated_portuguese_on_the_back(self, book):
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True)
         rows = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
         front, back = rows[1]
@@ -72,7 +72,7 @@ class TestBookRun:
 
     def test_audio_is_hashed_and_deduplicated(self, book):
         """The fixture repeats a line; both cards should share one clip."""
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True)
         base = os.path.dirname(book)
         rows = read_tsv(os.path.join(base, "deck_AnkiDeck.tsv"))
@@ -84,18 +84,18 @@ class TestBookRun:
     def test_output_name_defaults_to_a_slug(self, make_epub):
         book = make_epub([("chapter1.xhtml", "<p>Hello there.</p>")],
                          name="A Very Long Book Title -- 2017.epub")
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english", no_cache=True)
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english", no_cache=True)
         assert os.path.exists(
             os.path.join(os.path.dirname(book), "a-very-long-book-title-2017_AnkiDeck.tsv")
         )
 
     def test_limit_zero_is_a_parse_only_dry_run(self, book):
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", limit=0, no_cache=True)
         assert not os.path.exists(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
 
     def test_limit_caps_the_number_of_cards(self, book):
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", limit=2, no_cache=True)
         rows = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
         assert len(rows) == 2
@@ -107,7 +107,7 @@ class TestCaches:
         return make_epub([("chapter1.xhtml", "<p>Hello there.</p>")])
 
     def test_translation_and_lemma_caches_are_written(self, book):
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck")
         base = os.path.dirname(book)
         with open(os.path.join(base, "deck_translations.json"), encoding="utf-8") as f:
@@ -115,18 +115,18 @@ class TestCaches:
         assert os.path.exists(os.path.join(base, "deck_lemmas.json"))
 
     def test_a_second_run_reuses_the_cache_instead_of_translating(self, book, monkeypatch):
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck")
 
         def explode(*_a, **_k):
             raise AssertionError("translated despite a warm cache")
 
         monkeypatch.setattr(run, "translate_chunk", explode)
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck")
 
     def test_no_cache_writes_nothing(self, book):
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True)
         base = os.path.dirname(book)
         assert not os.path.exists(os.path.join(base, "deck_translations.json"))
@@ -146,29 +146,29 @@ class TestSubtitleRun:
         return str(path)
 
     def test_study_language_on_the_front_by_default(self, srt):
-        run.create_anki_deck(srt, "gtts", no_cache=True)
+        run.create_anki_deck(srt, "gtts", translator_name="google", no_cache=True)
         rows = read_tsv(srt.replace(".srt", "_AnkiDeck.tsv"))
         assert rows[0][0].startswith("O gato dorme. [sound:")
         assert rows[0][1].startswith("<en>O gato dorme.")
 
     def test_annotation_only_blocks_are_dropped(self, srt):
-        run.create_anki_deck(srt, "gtts", no_cache=True)
+        run.create_anki_deck(srt, "gtts", translator_name="google", no_cache=True)
         rows = read_tsv(srt.replace(".srt", "_AnkiDeck.tsv"))
         assert len(rows) == 2
 
     def test_audio_is_numbered_by_position_not_hashed(self, srt):
-        run.create_anki_deck(srt, "gtts", no_cache=True)
+        run.create_anki_deck(srt, "gtts", translator_name="google", no_cache=True)
         clips = sorted(os.listdir(srt.replace(".srt", "_Audio")))
         assert clips == ["ep_0001.mp3", "ep_0002.mp3"]
 
     def test_existing_clips_are_not_regenerated(self, srt, monkeypatch):
-        run.create_anki_deck(srt, "gtts", no_cache=True)
+        run.create_anki_deck(srt, "gtts", translator_name="google", no_cache=True)
 
         def explode(*_a, **_k):
             raise AssertionError("regenerated an existing clip")
 
         monkeypatch.setattr(run, "generate_audio", explode)
-        run.create_anki_deck(srt, "gtts", no_cache=True)
+        run.create_anki_deck(srt, "gtts", translator_name="google", no_cache=True)
 
 
 class TooMany(Exception):
@@ -197,7 +197,7 @@ class TestThrottling:
                 return "\n".join(f"<pt>{l}" for l in text.split("\n"))
 
         monkeypatch.setattr(run, "GoogleTranslator", Stub)
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True)
         rows = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
         assert len(rows) == 3
@@ -212,7 +212,7 @@ class TestThrottling:
                 raise TooMany()
 
         monkeypatch.setattr(run, "GoogleTranslator", Stub)
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True,
                              rate_limit_give_up=1)
         deck = os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv")
@@ -233,7 +233,7 @@ class TestThrottling:
                 raise TooMany()
 
         monkeypatch.setattr(run, "GoogleTranslator", Stub)
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True,
                              rate_limit_give_up=1)
         assert len(read_tsv(deck)) == 50
@@ -285,7 +285,7 @@ class TestThrottledRetry:
 
     def test_single_batch_waits_and_retries_until_it_succeeds(self, book, monkeypatch, waits):
         monkeypatch.setattr(run, "GoogleTranslator", self._flaky(2, "pt"))
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True, rate_limit_wait=1)
         rows = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
         assert len(rows) == 2, "cards should be produced once the throttle lifts"
@@ -293,13 +293,13 @@ class TestThrottledRetry:
 
     def test_backoff_escalates_between_retries(self, book, monkeypatch, waits):
         monkeypatch.setattr(run, "GoogleTranslator", self._flaky(3, "pt"))
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True, rate_limit_wait=10)
         assert waits[:3] == [10, 20, 40]
 
     def test_glosses_are_retried_not_abandoned_on_first_refusal(self, book, monkeypatch, waits):
         monkeypatch.setattr(run, "GoogleTranslator", self._flaky(2, "en"))
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True, rate_limit_wait=1)
         deck = read_tsv(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))
         assert any("(<en>" in row[1] for row in deck), "glosses should arrive after the retry"
@@ -307,7 +307,7 @@ class TestThrottledRetry:
     def test_gloss_retries_honour_the_configured_give_up(self, book, monkeypatch, waits):
         """The limiter used to be rebuilt per batch with default settings."""
         monkeypatch.setattr(run, "GoogleTranslator", self._flaky(999, "en"))
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True,
                              rate_limit_wait=1, rate_limit_give_up=3)
         # Two waits, then the third refusal exhausts it.
@@ -317,7 +317,7 @@ class TestThrottledRetry:
 
     def test_no_empty_deck_is_written_when_nothing_translated(self, book, monkeypatch, waits):
         monkeypatch.setattr(run, "GoogleTranslator", self._flaky(999, "pt"))
-        run.create_anki_deck(book, "gtts", input_lang="en", front="english",
+        run.create_anki_deck(book, "gtts", translator_name="google", input_lang="en", front="english",
                              output_name="deck", no_cache=True,
                              rate_limit_wait=1, rate_limit_give_up=2)
         assert not os.path.exists(os.path.join(os.path.dirname(book), "deck_AnkiDeck.tsv"))

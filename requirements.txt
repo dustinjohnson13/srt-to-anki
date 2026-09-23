@@ -1,4 +1,5 @@
 deep-translator
+argostranslate    # offline translation models (optional but preferred)
 spacy
 gTTS
 pydub

@@ -92,6 +92,8 @@ Book audio is named by a hash of its text rather than by position. Re-running af
 | `--translation-srt <file>` | — | Take the English side from this subtitle file instead of the API |
 | `--no-translate` | off | Skip translation entirely. Fast, no network calls; card backs are empty |
 | `--keep-annotations` | off | Keep `[explosão distante]` / `[Sonic]` instead of filtering them out |
+| `--translator <name>` | `auto` | `auto`, `argos` (offline), `google`, or `mymemory` |
+| `--translator-delay <s>` | `1.5` | Minimum gap between MyMemory requests |
 | `--no-cache` | off | Ignore and don't write the translation and lemma caches |
 | `--rate-limit-wait <s>` | `60` | Wait after the first rate-limit refusal, doubling each time, capped at 10 min |
 | `--rate-limit-give-up <n>` | `5` | Stop after this many consecutive refusals and leave the rest to a later run |
@@ -130,6 +132,28 @@ Detecting audio offset...
 ```
 
 The estimate is used only when it's confident: the correlation peak must stand clear of the noise, and the offsets computed independently from each half of the file must agree. Otherwise it reports what it found and falls back to `--audio-offset`, rather than silently misaligning every clip.
+
+### Translation backends
+
+`--translator auto` (the default) prefers the **offline Argos model**, falling back to Google and then MyMemory.
+
+Offline is the recommended path: no key, no quota, no rate limit, nothing leaves your machine, and it translates this 1,586-paragraph book in about nine minutes. Install the model once:
+
+```bash
+pip install argostranslate
+python run.py <book.epub> --input-lang en --translator argos --limit 5   # downloads on first use
+```
+
+The models are ~80 MB per direction and live in `~/.local/share/argos-translate`. `auto` uses them only when already installed, so it never surprises you with a large download; naming `argos` explicitly fetches them.
+
+**Portuguese uses Argos's `pb` model, not `pt`.** Those are different models and the difference is not cosmetic:
+
+| | |
+|---|---|
+| `pt` (European) | *Estás a ficar mais forte. Tens de controlar a tua vida.* |
+| `pb` (Brazilian) | *Você está ficando mais forte. Você precisa assumir o controle de sua vida.* |
+
+Since the audio is Brazilian, cards in European Portuguese would work against you, so `pb` is wired in for `--source-lang pt`.
 
 ### When Google throttles you
 

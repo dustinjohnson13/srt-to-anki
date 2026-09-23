@@ -54,6 +54,8 @@ LANGUAGE_CONFIGS = {
         "gtts_lang": "pt",
         "gtts_tld": "com.br",
         "translator_source": "pt",
+        "mymemory_code": "pt-BR",
+        "argos_code": "pb",
         "gender_articles": {"Masc": "o", "Fem": "a"},
         "verb_suffixes": ["ar", "er", "ir"],
         "tts_voices": {
@@ -90,6 +92,8 @@ LANGUAGE_CONFIGS = {
         "gtts_lang": "fr",
         "gtts_tld": None,
         "translator_source": "fr",
+        "mymemory_code": "fr-FR",
+        "argos_code": "fr",
         "gender_articles": {"Masc": "le", "Fem": "la"},
         "verb_suffixes": ["er", "ir", "re", "oir"],
         "tts_voices": {
@@ -108,6 +112,8 @@ LANGUAGE_CONFIGS = {
         "gtts_lang": "ru",
         "gtts_tld": None,
         "translator_source": "ru",
+        "mymemory_code": "ru-RU",
+        "argos_code": "ru",
         # Russian has no articles, so gender rides along as a tag instead.
         "gender_articles": {},
         "gender_tags": {"Masc": "m.", "Fem": "f.", "Neut": "n."},
@@ -626,6 +632,309 @@ def detect_audio_offset(source_audio, srt_spans, max_lag_ms=120000, fps=100):
     return (offset_ms if confident else None), stats
 
 
+# MyMemory wants locale codes, and answers an exhausted quota with a warning
+# *as the translated text* rather than an error -- which would otherwise be
+# cached as a word's definition.
+MYMEMORY_ENGLISH = "en-US"
+QUOTA_MESSAGE_RE = re.compile(
+    r"(MYMEMORY WARNING|YOU USED ALL AVAILABLE FREE TRANSLATIONS|"
+    r"QUERY LENGTH LIMIT EXCEEDED|INVALID EMAIL PROVIDED)",
+    re.I,
+)
+
+
+def looks_like_quota_message(text):
+    """Whether a 'translation' is really the service telling us to stop."""
+    return bool(text) and bool(QUOTA_MESSAGE_RE.search(str(text)))
+
+
+class ThrottledTranslator:
+    """Spaces out requests to a backend, and counts what we have spent.
+
+    MyMemory's free tier is a courtesy rather than a contract: it asks for
+    modest use and answers abuse with a block. Leaving a gap between requests
+    keeps us inside that, and the character counter makes the daily allowance
+    visible instead of discovering it as a garbled card.
+    """
+
+    def __init__(self, inner, name, min_interval=1.5, char_budget=None,
+                 max_query_chars=None):
+        self.inner = inner
+        self.name = name
+        self.min_interval = min_interval
+        self.char_budget = char_budget
+        # MyMemory rejects anything over 500 characters outright, and callers
+        # batch by joining lines, so the split happens here rather than making
+        # every caller know the limit.
+        self.max_query_chars = max_query_chars
+        self.chars_sent = 0
+        self._last_call = None
+        self._warned = False
+
+    @property
+    def source(self):
+        return getattr(self.inner, "source", None)
+
+    @property
+    def target(self):
+        return getattr(self.inner, "target", None)
+
+    def translate(self, text):
+        if self.max_query_chars and len(text) > self.max_query_chars:
+            return "\n".join(
+                self._send(group) for group in self._split(text)
+            )
+        return self._send(text)
+
+    def _split(self, text):
+        """Group whole lines into requests under the service's size limit.
+
+        Splitting on line boundaries keeps the response line count equal to the
+        request's, which is what callers map back positionally.
+        """
+        group, size = [], 0
+        for line in text.split("\n"):
+            if group and size + len(line) + 1 > self.max_query_chars:
+                yield "\n".join(group)
+                group, size = [], 0
+            group.append(line)
+            size += len(line) + 1
+        if group:
+            yield "\n".join(group)
+
+    def _send(self, text):
+        # Nothing to space the first request from.
+        if self._last_call is not None:
+            gap = self.min_interval - (time.monotonic() - self._last_call)
+            if gap > 0:
+                time.sleep(gap)
+        self._last_call = time.monotonic()
+        self.chars_sent += len(text)
+        if (
+            self.char_budget
+            and self.chars_sent > self.char_budget
+            and not self._warned
+        ):
+            self._warned = True
+            print(
+                f"  Note: about {self.chars_sent} characters sent to {self.name} this run, "
+                f"past its usual free daily allowance of {self.char_budget}."
+            )
+        return self.inner.translate(text)
+
+
+class FallbackTranslator:
+    """Tries backends in order, moving on for good when one refuses us.
+
+    Google's free translation endpoints currently answer programmatic requests
+    with 429 regardless of address, so a run that starts there needs somewhere
+    to go. The switch is permanent for the run: once a service has refused us,
+    going back to it on the next batch would just collect another refusal.
+    """
+
+    def __init__(self, backends):
+        self.backends = backends  # [(name, translator), ...]
+        self.index = 0
+
+    @property
+    def name(self):
+        return self.backends[self.index][0]
+
+    def translate(self, text):
+        while True:
+            name, backend = self.backends[self.index]
+            try:
+                result = backend.translate(text)
+            except Exception:
+                if self.index + 1 < len(self.backends):
+                    self.index += 1
+                    print(
+                        f"  {name} refused the request; switching to "
+                        f"{self.backends[self.index][0]} for the rest of this run."
+                    )
+                    continue
+                raise
+            if looks_like_quota_message(result) and self.index + 1 < len(self.backends):
+                self.index += 1
+                print(
+                    f"  {name} reports its quota is spent; switching to "
+                    f"{self.backends[self.index][0]} for the rest of this run."
+                )
+                continue
+            return result
+
+
+class ArgosTranslator:
+    """A local offline model. No network, no quota, no rate limit.
+
+    Argos distinguishes European Portuguese ("pt") from Brazilian ("pb") as
+    separate models, and they differ sharply -- "Estas a ficar mais forte"
+    against "Voce esta ficando mais forte" -- so the code comes from
+    `argos_code` rather than reusing `translator_source`.
+    """
+
+    def __init__(self, source, target, allow_download=False):
+        import argostranslate.package
+        import argostranslate.translate
+
+        self.source, self.target = source, target
+        self._translate = argostranslate.translate.translate
+        if not self._pair_installed(argostranslate.translate):
+            if not allow_download:
+                raise RuntimeError(
+                    f"offline {source}->{target} model not installed"
+                )
+            print(f"  Downloading the offline {source}->{target} model (one time)...")
+            argostranslate.package.update_package_index()
+            package = next(
+                (
+                    x
+                    for x in argostranslate.package.get_available_packages()
+                    if x.from_code == source and x.to_code == target
+                ),
+                None,
+            )
+            if package is None:
+                raise RuntimeError(f"no offline model published for {source}->{target}")
+            argostranslate.package.install_from_path(package.download())
+
+    def _pair_installed(self, argos_translate):
+        langs = {l.code: l for l in argos_translate.get_installed_languages()}
+        if self.source not in langs or self.target not in langs:
+            return False
+        return langs[self.source].get_translation(langs[self.target]) is not None
+
+    def translate(self, text):
+        return self._translate(text, self.source, self.target)
+
+
+class TranslationBackend:
+    """One translation service.
+
+    A subclass says how to address the service and how politely to use it;
+    `build_translator` composes them without knowing any of those details, so
+    adding a service is a class plus a registry entry rather than another
+    branch in a factory.
+    """
+
+    name = "backend"
+    min_interval = 0.0        # seconds to leave between requests
+    char_budget = None        # free allowance worth warning about
+    max_query_chars = None    # hard per-request limit; split on line boundaries
+    config_key = None         # LANGUAGE_CONFIGS key holding this service's code
+    english = "en"            # how this service spells English
+    honours_delay = False     # whether --translator-delay applies
+
+    @classmethod
+    def code_for(cls, code, lang_config):
+        if code == "en":
+            return cls.english
+        return lang_config.get(cls.config_key, code) if cls.config_key else code
+
+    @classmethod
+    def build(cls, source, target, lang_config, explicit=False, delay=None):
+        inner = cls.connect(
+            cls.code_for(source, lang_config),
+            cls.code_for(target, lang_config),
+            explicit,
+        )
+        interval = delay if (cls.honours_delay and delay is not None) else cls.min_interval
+        return ThrottledTranslator(
+            inner,
+            cls.name,
+            min_interval=interval,
+            char_budget=cls.char_budget,
+            max_query_chars=cls.max_query_chars,
+        )
+
+    @staticmethod
+    def connect(source, target, explicit):
+        raise NotImplementedError
+
+
+class ArgosBackend(TranslationBackend):
+    """Local model: no network, no quota, no rate limit."""
+
+    name = "Argos"
+    config_key = "argos_code"
+
+    @staticmethod
+    def connect(source, target, explicit):
+        # Only download when the user asked for this backend by name, so
+        # "auto" never triggers a surprise several-hundred-megabyte fetch.
+        return ArgosTranslator(source, target, allow_download=explicit)
+
+
+class GoogleBackend(TranslationBackend):
+    """The free endpoint deep-translator scrapes. Plain language codes."""
+
+    name = "Google"
+
+    @staticmethod
+    def connect(source, target, explicit):
+        return GoogleTranslator(source=source, target=target)
+
+
+class MyMemoryBackend(TranslationBackend):
+    """Keyless, but a small daily allowance and a hard 500-character query cap."""
+
+    name = "MyMemory"
+    config_key = "mymemory_code"
+    english = "en-US"
+    min_interval = 1.5
+    honours_delay = True
+    char_budget = 5000        # the anonymous daily allowance
+    max_query_chars = 450     # its hard limit is 500
+
+    @staticmethod
+    def connect(source, target, explicit):
+        from deep_translator import MyMemoryTranslator
+
+        return MyMemoryTranslator(source=source, target=target)
+
+
+TRANSLATION_BACKENDS = {
+    "argos": ArgosBackend,
+    "google": GoogleBackend,
+    "mymemory": MyMemoryBackend,
+}
+
+# Offline first: it has no quota and cannot be throttled.
+AUTO_TRANSLATOR_ORDER = ["argos", "google", "mymemory"]
+
+
+def build_translator(spec, source, target, lang_config, delay=1.5):
+    """A translator for `spec`: one service, or "auto" to chain them.
+
+    `source` and `target` are plain codes ("pt", "en"); each backend converts
+    them to whatever dialect it expects.
+    """
+    names = AUTO_TRANSLATOR_ORDER if spec == "auto" else [spec]
+    backends = []
+    for name in names:
+        backend = TRANSLATION_BACKENDS.get(name)
+        if backend is None:
+            raise ValueError(f"Unknown translator: {name}")
+        try:
+            backends.append(
+                (
+                    name,
+                    backend.build(
+                        source, target, lang_config, explicit=(spec == name), delay=delay
+                    ),
+                )
+            )
+        except Exception as e:
+            if spec != "auto":
+                raise
+            # In "auto" an unavailable service just means trying the next.
+            if name == "argos":
+                print(f"  Offline translation unavailable ({e}); using online services.")
+    if not backends:
+        raise RuntimeError("No translation backend is available")
+    return FallbackTranslator(backends)
+
+
 def is_rate_limited(exc):
     """Whether an exception is the endpoint refusing us for rate reasons."""
     if TooManyRequests is not None and isinstance(exc, TooManyRequests):
@@ -693,6 +1002,11 @@ def translate_with_retry(translator, text, tries=4, base_delay=2.0, limiter=None
     for attempt in range(1, tries + 1):
         try:
             result = translator.translate(text)
+            if looks_like_quota_message(result):
+                # The service answered with its quota warning as the text.
+                if limiter:
+                    limiter.record_limit()
+                return None
             if result:
                 if limiter:
                     limiter.record_success()
@@ -896,7 +1210,7 @@ def format_card(study_sentence, known_sentence, audio_filename, vocab_html, fron
     return front_of_card, back_of_card
 
 
-def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False, detect_offset=False, translation_srt=None, source_lang="pt", input_lang=None, front="study", output_name=None, limit=None, merge_frags=True, keep_front_matter=False, rate_limit_wait=60.0, rate_limit_give_up=5):
+def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padding=100, audio_offset=0, keep_annotations=False, no_cache=False, no_translate=False, detect_offset=False, translation_srt=None, source_lang="pt", input_lang=None, front="study", output_name=None, limit=None, merge_frags=True, keep_front_matter=False, rate_limit_wait=60.0, rate_limit_give_up=5, translator_name="auto", translator_delay=1.5):
     lang_config = LANGUAGE_CONFIGS[source_lang]
     input_lang = input_lang or source_lang
     # The input is already the study language unless it is English, in which
@@ -945,11 +1259,17 @@ def create_anki_deck(input_filepath, tts_provider, audio_source=None, audio_padd
     # Book mode generates the study language from English; subtitle mode
     # translates the study language into English.
     if generated_study:
-        translator = GoogleTranslator(source=input_lang, target=study_code)
+        translator = build_translator(
+            translator_name, input_lang, study_code, lang_config, translator_delay
+        )
     else:
-        translator = GoogleTranslator(source=study_code, target="en")
+        translator = build_translator(
+            translator_name, study_code, "en", lang_config, translator_delay
+        )
     # Vocabulary definitions always run study language -> English.
-    lemma_translator = GoogleTranslator(source=study_code, target="en")
+    lemma_translator = build_translator(
+        translator_name, study_code, "en", lang_config, translator_delay
+    )
 
     preloaded_translations = None
     source_audio = None
@@ -1399,6 +1719,23 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--translator",
+        choices=["auto", "argos", "google", "mymemory"],
+        default="auto",
+        help=(
+            "Translation backend (default: auto). 'auto' prefers the offline "
+            "Argos model when its data is installed, then Google, then MyMemory. "
+            "'argos' downloads the model if needed and never touches the network "
+            "again; it uses Brazilian Portuguese, not European."
+        ),
+    )
+    parser.add_argument(
+        "--translator-delay",
+        type=float,
+        default=1.5,
+        help="Minimum seconds between MyMemory requests, to stay within its free tier (default: 1.5).",
+    )
+    parser.add_argument(
         "--rate-limit-wait",
         type=float,
         default=60.0,
@@ -1498,4 +1835,6 @@ if __name__ == "__main__":
         keep_front_matter=args.keep_front_matter,
         rate_limit_wait=args.rate_limit_wait,
         rate_limit_give_up=args.rate_limit_give_up,
+        translator_name=args.translator,
+        translator_delay=args.translator_delay,
     )
